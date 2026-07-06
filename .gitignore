@@ -1,0 +1,42 @@
+# Build output
+build/
+cmake-build-*/
+
+# Models (large binary files)
+models/
+
+# Python cache
+scripts/__pycache__/
+scripts/gguf/__pycache__/
+scripts/gguf/scripts/__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+
+# Python virtual envs
+.venv/
+venv/
+env/
+
+# Editor / IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python packaging artifacts
+*.egg-info/
+dist/
+*.egg
+
+# Compiled output
+*.o
+*.a
+*.so
+*.dylib
+frostfall

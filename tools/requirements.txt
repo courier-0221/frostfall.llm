@@ -1,0 +1,18 @@
+# tools/gguf 库与 convert_hf_to_gguf.py 运行所需的 Python 依赖
+# 安装方式（在 conda 环境 llm_infer 下）：
+#   conda run -n llm_infer pip install -r tools/requirements.txt
+
+# --- gguf 库核心依赖 ---
+numpy>=1.17
+tqdm>=4.27
+sentencepiece>=0.1.98
+pyyaml>=5.1
+
+# --- convert_hf_to_gguf.py（HuggingFace -> GGUF 转换）额外依赖 ---
+transformers>=4.45.1,<5.0.0
+torch>=2.2.0
+safetensors>=0.4.0
+protobuf>=4.21.0,<5.0.0
+
+# --- 可选：仅在转换 Mistral 官方格式模型时需要，默认可注释掉 ---
+# mistral-common>=1.8.3
