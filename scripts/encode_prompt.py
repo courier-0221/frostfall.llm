@@ -6,10 +6,9 @@ frostfall v0.1 还没有自研分词器（推迟到 v0.2，见 doc/design.md）�
 供 C++ 端（frostfall -i tokens_in.txt）直接读取。
 
 用法:
-    python scripts/encode_prompt.py \
-        --model /home/lil72/data/model/Qwen3-0___6B \
-        --prompt "你好，介绍一下你自己" \
-        --out tokens_in.txt
+    python scripts/encode_prompt.py --model ../models/Qwen3-0.6B \
+        --prompt "你好,介绍下你自己"\
+        --out logs/tokens_in.txt
 """
 import argparse
 
@@ -33,12 +32,13 @@ def main():
         ids = tok(args.prompt).input_ids
     else:
         messages = [{"role": "user", "content": args.prompt}]
-        ids = tok.apply_chat_template(
+        result = tok.apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=True,
             enable_thinking=args.enable_thinking,
         )
+        ids = result["input_ids"] if not isinstance(result, list) else result
 
     with open(args.out, "w") as f:
         f.write(" ".join(map(str, ids)))

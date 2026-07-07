@@ -143,10 +143,13 @@ frostfall.llm/
 │   ├── sampler.{h,cpp}          # greedy / temperature / top-k / top-p
 │   └── common.{h,cpp}           # 参数解析、计时、日志等小工具
 ├── scripts/
+│   ├── encode_prompt.py         # v0.1 用：文本 -> token id 文件（依赖 transformers）
+│   ├── decode_tokens.py         # v0.1 用：token id 文件 -> 文本（依赖 transformers）
+│   └── compare_llamacpp.py      # v0.1 用：与 llama.cpp 对拍验证
+├── tools/
 │   ├── convert_hf_to_gguf.py    # HF → GGUF 转换脚本（拷贝自 llama.cpp）
 │   ├── convert_hf_to_gguf_update.py
-│   ├── gguf/                     # 转换脚本依赖的 gguf-py 包（拷贝自 llama.cpp）
-│   └── encode_prompt.py         # v0.1 用：transformers 预处理 prompt → token id
+│   ├── gguf_py/                 # 转换脚本依赖的 gguf-py 包（拷贝自 llama.cpp）
 ├── models/                      # 放 qwen3-0.6b GGUF 文件（.gitignore）
 ├── third_party/ggml/            # ggml源码
 ├── CMakeLists.txt

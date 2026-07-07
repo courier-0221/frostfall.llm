@@ -7,7 +7,7 @@ transformers 只在 encode / compare 两步加载；run-ff 和 run-llama 不依�
 典型用法：
 
   WORKDIR=work/cmp
-  HF=/home/lil72/data/model/Qwen3-0___6B
+  HF=/home/data/model/Qwen3-0.6B
   MODEL=models/qwen3-0.6b-f16.gguf
 
   # 步骤 1：编码 prompt（加载 transformers，完成后进程退出，内存释放）
@@ -18,9 +18,11 @@ transformers 只在 encode / compare 两步加载；run-ff 和 run-llama 不依�
   python scripts/compare_llamacpp.py run-ff \\
       --frostfall-bin build/frostfall --model $MODEL --workdir $WORKDIR -n 16
 
-  # 步骤 3：运行 llama-cli（无需 transformers）
+  # 步骤 3：运行 llama.cpp（无需 transformers）
+  # 注意：新版 llama.cpp（约 b8300+）的 llama-cli 只做交互式聊天、不再支持 -no-cnv，
+  #       非交互一次性补全请改用 llama-completion。旧版仍可传 llama-cli。
   python scripts/compare_llamacpp.py run-llama \\
-      --llama-cli /home/lil72/data/llama.cpp/build/bin/llama-cli \\
+      --llama-cli /home/data/llama.cpp/build/bin/llama-completion \\
       --model $MODEL --workdir $WORKDIR -n 16
 
   # 步骤 4：解码并对比（加载 transformers，完成后进程退出）
@@ -36,8 +38,17 @@ workdir 中的中间文件：
 """
 import argparse
 import os
+import re
 import subprocess
 import sys
+
+# llama-completion 会用 ANSI 颜色码高亮回显的 prompt（如 \x1b[33m...\x1b[0m），
+# 比对前必须剥掉，否则 startswith(prompt) 判定失败、prompt 前缀去不掉 -> 误报差异。
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(s):
+    return _ANSI_RE.sub("", s)
 
 _TOKENS_IN  = "tokens_in.txt"
 _PROMPT_N   = "prompt_n.txt"
@@ -123,7 +134,7 @@ def cmd_compare(args):
     with open(_wf(args.workdir, _PROMPT_N))   as f: n_prompt   = int(f.read().strip())
     with open(_wf(args.workdir, _PROMPT_TXT)) as f: prompt     = f.read()
     with open(_wf(args.workdir, _TOKENS_FF))  as f: all_ids    = [int(x) for x in f.read().split()]
-    with open(_wf(args.workdir, _LLAMA_OUT))  as f: llama_full = f.read()
+    with open(_wf(args.workdir, _LLAMA_OUT))  as f: llama_full = _strip_ansi(f.read())
 
     tok = AutoTokenizer.from_pretrained(args.hf_model, trust_remote_code=True)
 
@@ -171,8 +182,10 @@ def main():
     p.add_argument("-n", "--n-predict", type=int, default=16)
     p.add_argument("-t", "--threads",   type=int, default=4)
 
-    p = sub.add_parser("run-llama", help="步骤3: 运行 llama-cli 生成文本（无需 transformers）")
-    p.add_argument("--llama-cli", required=True)
+    p = sub.add_parser("run-llama", help="步骤3: 运行 llama.cpp 生成文本（无需 transformers）")
+    p.add_argument("--llama-cli", required=True,
+                   help="llama.cpp 补全程序路径；新版（约 b8300+）请用 llama-completion，"
+                        "旧版可用 llama-cli")
     p.add_argument("--model",   required=True, help="GGUF 模型路径")
     p.add_argument("--workdir", required=True)
     p.add_argument("-n", "--n-predict", type=int, default=16)

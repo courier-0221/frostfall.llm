@@ -4,8 +4,10 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 
+#include <glog/logging.h>
+
 #include <algorithm>
-#include <cstdio>
+#include <iomanip>
 #include <vector>
 
 qwen3_model::~qwen3_model() {
@@ -48,7 +50,7 @@ float gguf_get_f32_any(const gguf_context * ctx, const char * key, float def) {
 bool qwen3_load_tensor_data(const std::string & fname, ggml_context * ctx_data, gguf_context * ctx_gguf) {
     FILE * f = ggml_fopen(fname.c_str(), "rb");
     if (!f) {
-        fprintf(stderr, "%s: failed to reopen '%s' for reading weights\n", __func__, fname.c_str());
+        LOG(ERROR) << __func__ << ": failed to reopen '" << fname << "' for reading weights";
         return false;
     }
 
@@ -98,15 +100,14 @@ bool qwen3_model_load(const std::string & fname, qwen3_model & model) {
 
     gguf_context * ctx_gguf = gguf_init_from_file(fname.c_str(), params);
     if (!ctx_gguf) {
-        fprintf(stderr, "%s: gguf_init_from_file() failed for '%s'\n", __func__, fname.c_str());
+        LOG(ERROR) << __func__ << ": gguf_init_from_file() failed for '" << fname << "'";
         return false;
     }
 
     const int64_t kid_arch = gguf_find_key(ctx_gguf, "general.architecture");
     const std::string arch = kid_arch >= 0 ? gguf_get_val_str(ctx_gguf, kid_arch) : "";
     if (arch != "qwen3") {
-        fprintf(stderr, "%s: unsupported architecture '%s' (this framework only supports 'qwen3')\n",
-                __func__, arch.c_str());
+        LOG(ERROR) << __func__ << ": unsupported architecture '" << arch << "' (this framework only supports 'qwen3')";
         gguf_free(ctx_gguf);
         return false;
     }
@@ -122,13 +123,14 @@ bool qwen3_model_load(const std::string & fname, qwen3_model & model) {
     hp.rms_norm_eps   = gguf_get_f32_any(ctx_gguf, "qwen3.attention.layer_norm_rms_epsilon", 1e-6f);
     hp.rope_freq_base = gguf_get_f32_any(ctx_gguf, "qwen3.rope.freq_base", 1000000.0f);
     hp.eos_token_id   = gguf_get_i32_any(ctx_gguf, "tokenizer.ggml.eos_token_id", -1);
+    hp.eot_token_id   = gguf_get_i32_any(ctx_gguf, "tokenizer.ggml.eot_token_id", 151645); // Qwen3 <|im_end|>
     hp.bos_token_id   = gguf_get_i32_any(ctx_gguf, "tokenizer.ggml.bos_token_id", -1);
 
     // 按名字取权重张量指针（张量本身已经由 gguf_init_from_file 建好在 model.ctx_data 里了）。
     auto get_tensor = [&](const std::string & name) -> ggml_tensor * {
         ggml_tensor * t = ggml_get_tensor(model.ctx_data, name.c_str());
         if (!t) {
-            fprintf(stderr, "%s: missing tensor '%s'\n", __func__, name.c_str());
+            LOG(ERROR) << __func__ << ": missing tensor '" << name << "'";
         }
         return t;
     };
@@ -142,22 +144,28 @@ bool qwen3_model_load(const std::string & fname, qwen3_model & model) {
     hp.n_vocab = (int32_t) model.tok_embd->ne[1];
 
     if (hp.n_embd <= 0 || hp.n_layer <= 0 || hp.n_head <= 0 || hp.n_embd_head <= 0 || hp.n_ff <= 0) {
-        fprintf(stderr, "%s: incomplete hparams read from GGUF metadata\n", __func__);
+        LOG(ERROR) << __func__ << ": incomplete hparams read from GGUF metadata";
         gguf_free(ctx_gguf);
         return false;
     }
 
-    fprintf(stderr,
-            "%s: n_vocab=%d n_embd=%d n_layer=%d n_head=%d n_head_kv=%d n_embd_head=%d n_ff=%d "
-            "eps=%g rope_base=%g eos=%d\n",
-            __func__, hp.n_vocab, hp.n_embd, hp.n_layer, hp.n_head, hp.n_head_kv, hp.n_embd_head,
-            hp.n_ff, hp.rms_norm_eps, hp.rope_freq_base, hp.eos_token_id);
+    LOG(INFO) << __func__
+              << ": n_vocab=" << hp.n_vocab
+              << " n_embd=" << hp.n_embd
+              << " n_layer=" << hp.n_layer
+              << " n_head=" << hp.n_head
+              << " n_head_kv=" << hp.n_head_kv
+              << " n_embd_head=" << hp.n_embd_head
+              << " n_ff=" << hp.n_ff
+              << " eps=" << hp.rms_norm_eps
+              << " rope_base=" << hp.rope_freq_base
+              << " eos=" << hp.eos_token_id;
 
     model.output_norm = get_tensor("output_norm.weight");
     model.output      = ggml_get_tensor(model.ctx_data, "output.weight"); // 可能不存在（tied embedding）
     if (!model.output) {
         model.output = model.tok_embd;
-        fprintf(stderr, "%s: 'output.weight' not found, reusing token_embd (tied embedding)\n", __func__);
+        LOG(INFO) << __func__ << ": 'output.weight' not found, reusing token_embd (tied embedding)";
     }
 
     if (!model.output_norm) {
@@ -189,7 +197,7 @@ bool qwen3_model_load(const std::string & fname, qwen3_model & model) {
     }
 
     if (!ok) {
-        fprintf(stderr, "%s: model is missing required tensors (see messages above)\n", __func__);
+        LOG(ERROR) << __func__ << ": model is missing required tensors (see messages above)";
         gguf_free(ctx_gguf);
         return false;
     }
@@ -197,26 +205,27 @@ bool qwen3_model_load(const std::string & fname, qwen3_model & model) {
     // 初始化 CPU backend，把 ctx_data 里所有张量实际分配到 backend buffer 上。
     model.backend = ggml_backend_cpu_init();
     if (!model.backend) {
-        fprintf(stderr, "%s: failed to init CPU backend\n", __func__);
+        LOG(ERROR) << __func__ << ": failed to init CPU backend";
         gguf_free(ctx_gguf);
         return false;
     }
 
     model.buffer = ggml_backend_alloc_ctx_tensors(model.ctx_data, model.backend);
     if (!model.buffer) {
-        fprintf(stderr, "%s: failed to allocate backend buffer for weights\n", __func__);
+        LOG(ERROR) << __func__ << ": failed to allocate backend buffer for weights";
         gguf_free(ctx_gguf);
         return false;
     }
 
     if (!qwen3_load_tensor_data(fname, model.ctx_data, ctx_gguf)) {
-        fprintf(stderr, "%s: failed to read weight data from '%s'\n", __func__, fname.c_str());
+        LOG(ERROR) << __func__ << ": failed to read weight data from '" << fname << "'";
         gguf_free(ctx_gguf);
         return false;
     }
 
-    fprintf(stderr, "%s: weights buffer size = %.2f MB\n",
-            __func__, ggml_backend_buffer_get_size(model.buffer) / 1024.0 / 1024.0);
+    LOG(INFO) << __func__ << ": weights buffer size = "
+              << std::fixed << std::setprecision(2)
+              << ggml_backend_buffer_get_size(model.buffer) / 1024.0 / 1024.0 << " MB";
 
     gguf_free(ctx_gguf);
     return true;

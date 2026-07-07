@@ -3,8 +3,8 @@
 
 用法:
     python scripts/decode_tokens.py \
-        --model /home/lil72/data/model/Qwen3-0___6B \
-        --ids-file tokens_out.txt
+        --model ../models/Qwen3-0.6B \
+        --ids-file logs/tokens_out.txt
 """
 import argparse
 

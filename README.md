@@ -28,6 +28,7 @@ frostfall.llm/
 │   ├── encode_prompt.py  # 文本 -> token id 文件（依赖 transformers）
 │   ├── decode_tokens.py  # token id 文件 -> 文本（依赖 transformers）
 │   └── compare_llamacpp.py  # 与 llama.cpp 对拍验证
+├── tools/                # gguf 转换脚本
 ├── third_party/ggml/     # ggml v0.15.3（git submodule）
 ├── doc/design.md         # 完整设计文档
 └── CMakeLists.txt
@@ -69,13 +70,11 @@ cmake --build build -j$(nproc)
 推理需要 F16 GGUF 格式，用 llama.cpp 的转换脚本生成：
 
 ```bash
-python /path/to/llama.cpp/convert_hf_to_gguf.py \
-    /path/to/Qwen3-0___6B \
+python /path/to/convert_hf_to_gguf.py \
+    /path/to/Qwen3-0.6B \
     --outfile models/qwen3-0.6b-f16.gguf \
     --outtype f16
 ```
-
-转换结果放到 `models/`（已加入 `.gitignore`，不会被提交）。
 
 ---
 
@@ -86,22 +85,22 @@ python /path/to/llama.cpp/convert_hf_to_gguf.py \
 ```bash
 # 套用 Qwen3 chat 模板（推荐）
 python scripts/encode_prompt.py \
-    --model /path/to/Qwen3-0___6B \
+    --model /path/to/Qwen3-0.6B \
     --prompt "你好，介绍一下你自己" \
-    --out tokens_in.txt
+    --out logs/tokens_in.txt
 
 # 不套 chat 模板，直接编码纯文本（对拍脚本用）
 python scripts/encode_prompt.py \
-    --model /path/to/Qwen3-0___6B \
+    --model /path/to/Qwen3-0.6B \
     --prompt "Hello" \
-    --out tokens_in.txt \
+    --out logs/tokens_in.txt \
     --no-chat-template
 
 # 开启 Qwen3 思考模式（<think> ... </think>）
 python scripts/encode_prompt.py \
-    --model /path/to/Qwen3-0___6B \
+    --model /path/to/Qwen3-0.6B \
     --prompt "1+1等于几" \
-    --out tokens_in.txt \
+    --out logs/tokens_in.txt \
     --enable-thinking
 ```
 
@@ -110,10 +109,10 @@ python scripts/encode_prompt.py \
 ```bash
 ./build/frostfall \
     -m models/qwen3-0.6b-f16.gguf \
-    -i tokens_in.txt \
-    -o tokens_out.txt \
+    -i logs/tokens_in.txt \
+    -o logs/tokens_out.txt \
     -n 128 \
-    -t 8
+    -t 4
 ```
 
 进度和计时打印到 stderr，完整 token id 序列（prompt + 生成）打印到 stdout 并写入 `-o` 文件。
@@ -123,13 +122,13 @@ python scripts/encode_prompt.py \
 ```bash
 # 查看完整输出（含 prompt）
 python scripts/decode_tokens.py \
-    --model /path/to/Qwen3-0___6B \
-    --ids-file tokens_out.txt
+    --model /path/to/Qwen3-0.6B \
+    --ids-file logs/tokens_out.txt
 
 # 只看新生成的部分（需告知 prompt 长度）
 python scripts/decode_tokens.py \
-    --model /path/to/Qwen3-0___6B \
-    --ids-file tokens_out.txt \
+    --model /path/to/Qwen3-0.6B \
+    --ids-file logs/tokens_out.txt \
     --prompt-len $(wc -w < tokens_in.txt)
 ```
 
@@ -153,15 +152,64 @@ usage: frostfall -m <model.gguf> -i <tokens_in.txt> [-o <tokens_out.txt>] [-n N]
 
 ## 正确性验证（对拍）
 
-v0.1 自带与 llama.cpp 的对拍脚本。同一 prompt、`--temp 0`，逐 token 比对：
+### 思路
+
+用成熟的 **llama.cpp 作为「标准答案」**，验证自研的 frostfall 输出是否一致。
+在 `--temp 0`（贪心解码、无随机性）前提下，同一模型 + 同一 prompt，每一步都应选出相同 token；
+只要两边最终生成的文本一致，就说明 frostfall 的「加载 → 构图 → 前向 → 解码」整条链路是正确的。
+
+### 实现（分 4 步独立执行）
+
+对拍脚本 `scripts/compare_llamacpp.py` 拆成 4 个子命令，各自独立进程运行、结果落盘到 `--workdir`。
+这样做的目的是让吃内存的 `transformers` 只在 **encode / compare** 两步加载，跑完即退出释放内存；
+`run-ff` 和 `run-llama` 不依赖任何大 Python 包。
+
+| 步骤 | 子命令 | 依赖 transformers | 做的事 |
+| --- | --- | --- | --- |
+| 1 | `encode` | 是 | 用 HF tokenizer 把 prompt 编成 token id，落盘 `tokens_in.txt` / `prompt_n.txt` / `prompt.txt` |
+| 2 | `run-ff` | 否 | 跑 frostfall，输入 token id，输出完整 id 序列到 `tokens_ff.txt` |
+| 3 | `run-llama` | 否 | 跑 llama.cpp 补全程序（`--temp 0`；新版用 `llama-completion`，旧版 `llama-cli`），stdout 存到 `llama_out.txt` |
+| 4 | `compare` | 是 | 解码 frostfall 新生成的 id 为文本，与 llama.cpp 续写文本比对 |
+
+对比时需对齐两边口径：frostfall 输出是「prompt + 新生成」的完整 token id，脚本切掉前 `prompt_n` 个 id
+再解码；llama.cpp 输出的文本含原 prompt 前缀，脚本去掉前缀取续写部分。两段文本 `strip()` 后相等即
+「完全一致 ✓」，否则提示按 `doc/design.md §8.5` 用逐层 dump 定位差异。
+
+`workdir` 中的中间文件：
+
+```
+tokens_in.txt   prompt token ids（空白分隔整数）
+prompt_n.txt    prompt token 数（一个整数）
+prompt.txt      prompt 原文
+tokens_ff.txt   frostfall 完整输出 token ids（prompt + 新生成）
+llama_out.txt   llama-cli stdout 原文
+```
+
+### 运行命令
 
 ```bash
-python scripts/compare_llamacpp.py \
-    --frostfall ./build/frostfall \
-    --llama-cli /path/to/llama.cpp/llama-cli \
-    --model models/qwen3-0.6b-f16.gguf \
-    --hf-model /path/to/Qwen3-0___6B \
-    --prompt "你好"
+WORKDIR=work/cmp
+HF=/path/to/Qwen3-0.6B
+MODEL=models/qwen3-0.6b-f16.gguf
+
+# 步骤 1：编码 prompt（加载 transformers，完成后进程退出，内存释放）
+conda run -n llm python scripts/compare_llamacpp.py encode \
+    --hf-model $HF --prompt "The capital of France is" --workdir $WORKDIR
+
+# 步骤 2：运行 frostfall（无需 transformers）
+python scripts/compare_llamacpp.py run-ff \
+    --frostfall-bin build/frostfall --model $MODEL --workdir $WORKDIR -n 16
+
+# 步骤 3：运行 llama.cpp（无需 transformers）
+# 注意：新版 llama.cpp（约 b8300+）的 llama-cli 只做交互式聊天、不再支持 -no-cnv，
+#       非交互一次性补全请改用 llama-completion；旧版仍可传 llama-cli。
+python scripts/compare_llamacpp.py run-llama \
+    --llama-cli /path/to/llama.cpp/build/bin/llama-completion \
+    --model $MODEL --workdir $WORKDIR -n 16
+
+# 步骤 4：解码并对比（加载 transformers，完成后进程退出）
+conda run -n llm python scripts/compare_llamacpp.py compare \
+    --hf-model $HF --workdir $WORKDIR
 ```
 
 ---

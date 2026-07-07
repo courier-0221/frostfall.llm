@@ -1,6 +1,6 @@
 # tools/gguf 库与 convert_hf_to_gguf.py 运行所需的 Python 依赖
-# 安装方式（在 conda 环境 llm_infer 下）：
-#   conda run -n llm_infer pip install -r tools/requirements.txt
+# 安装方式（在 conda 环境 llm 下）：
+#   conda run -n llm pip install -r tools/requirements.txt
 
 # --- gguf 库核心依赖 ---
 numpy>=1.17

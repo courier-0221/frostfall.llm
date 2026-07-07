@@ -40,7 +40,7 @@ except ImportError:
     get_one_valid_tokenizer_file = None
 
 
-import tools.gguf.gguf as gguf
+import gguf
 
 from .gguf_writer import GGUFWriter
 

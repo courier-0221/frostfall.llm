@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from .constants import Keys
 
-import tools.gguf.gguf as gguf
+import gguf
 
 logger = logging.getLogger("metadata")
 

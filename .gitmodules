@@ -2,3 +2,6 @@
 path = third_party/ggml
 url = https://github.com/ggml-org/ggml.git
 branch = v0.15.3
+[submodule "third_party/glog"]
+	path = third_party/glog
+	url = https://github.com/google/glog.git

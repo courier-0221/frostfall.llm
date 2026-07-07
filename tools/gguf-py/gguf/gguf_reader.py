@@ -21,7 +21,7 @@ if __name__ == "__main__":
     # Allow running file in package as a script.
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from tools.gguf.constants import (
+from gguf.constants import (
     GGML_QUANT_SIZES,
     GGUF_DEFAULT_ALIGNMENT,
     GGUF_MAGIC,

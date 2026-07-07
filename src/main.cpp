@@ -12,11 +12,14 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 
+#include <glog/logging.h>
+
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -52,7 +55,7 @@ bool parse_args(int argc, char ** argv, cli_args & args) {
 
         auto next_value = [&](const char * name) -> std::string {
             if (i + 1 >= argc) {
-                fprintf(stderr, "error: missing value for %s\n", name);
+                LOG(ERROR) << "missing value for " << name;
                 exit(1);
             }
             return argv[++i];
@@ -72,13 +75,13 @@ bool parse_args(int argc, char ** argv, cli_args & args) {
             print_usage(argv[0]);
             exit(0);
         } else {
-            fprintf(stderr, "error: unknown argument '%s'\n", arg.c_str());
+            LOG(ERROR) << "unknown argument '" << arg << "'";
             return false;
         }
     }
 
     if (args.model_path.empty() || args.tokens_in.empty()) {
-        fprintf(stderr, "error: -m/--model and -i/--tokens-in are required\n");
+        LOG(ERROR) << "-m/--model and -i/--tokens-in are required";
         return false;
     }
     return true;
@@ -109,6 +112,9 @@ int32_t argmax(const float * logits, int32_t n_vocab) {
 } // namespace
 
 int main(int argc, char ** argv) {
+    google::InitGoogleLogging(argv[0]);
+    FLAGS_logtostderr = true;
+
     cli_args args;
     if (!parse_args(argc, argv, args)) {
         print_usage(argv[0]);
@@ -119,13 +125,14 @@ int main(int argc, char ** argv) {
 
     qwen3_model model;
     if (!qwen3_model_load(args.model_path, model)) {
-        fprintf(stderr, "error: failed to load model from '%s'\n", args.model_path.c_str());
+        LOG(ERROR) << "failed to load model from '" << args.model_path << "'";
         return 1;
     }
 
     const auto t_loaded = std::chrono::steady_clock::now();
-    fprintf(stderr, "main: model loaded in %.2f s\n",
-            std::chrono::duration<double>(t_loaded - t_start).count());
+    LOG(INFO) << "model loaded in "
+              << std::fixed << std::setprecision(2)
+              << std::chrono::duration<double>(t_loaded - t_start).count() << " s";
 
     if (ggml_backend_is_cpu(model.backend)) {
         ggml_backend_cpu_set_n_threads(model.backend, args.n_threads);
@@ -133,10 +140,10 @@ int main(int argc, char ** argv) {
 
     std::vector<int32_t> ids = read_token_ids(args.tokens_in);
     if (ids.empty()) {
-        fprintf(stderr, "error: no token ids read from '%s'\n", args.tokens_in.c_str());
+        LOG(ERROR) << "no token ids read from '" << args.tokens_in << "'";
         return 1;
     }
-    fprintf(stderr, "main: prompt has %zu tokens\n", ids.size());
+    LOG(INFO) << "prompt has " << ids.size() << " tokens";
 
     const int32_t n_vocab   = model.hparams.n_vocab;
     const int32_t n_ctx_max = model.hparams.n_ctx_train;
@@ -150,7 +157,7 @@ int main(int argc, char ** argv) {
 
     for (int32_t step = 0; step < args.n_predict; ++step) {
         if ((int32_t) ids.size() >= n_ctx_max) {
-            fprintf(stderr, "main: reached n_ctx_train (%d), stopping\n", n_ctx_max);
+            LOG(WARNING) << "reached n_ctx_train (" << n_ctx_max << "), stopping";
             break;
         }
 
@@ -201,10 +208,11 @@ int main(int argc, char ** argv) {
         const int32_t next_id = argmax(logits.data(), n_vocab);
         ids.push_back(next_id);
 
-        fprintf(stderr, "main: step %3d -> token %d\n", step, next_id);
+        LOG(INFO) << "step " << std::setw(3) << step << " -> token " << next_id;
 
-        if (model.hparams.eos_token_id >= 0 && next_id == model.hparams.eos_token_id) {
-            fprintf(stderr, "main: eos token generated, stopping\n");
+        if ((model.hparams.eos_token_id >= 0 && next_id == model.hparams.eos_token_id) ||
+            (model.hparams.eot_token_id >= 0 && next_id == model.hparams.eot_token_id)) {
+            LOG(INFO) << "eos/eot token generated (" << next_id << "), stopping";
             break;
         }
     }
@@ -212,8 +220,10 @@ int main(int argc, char ** argv) {
     ggml_gallocr_free(allocr);
 
     const auto t_end = std::chrono::steady_clock::now();
-    fprintf(stderr, "main: generation done in %.2f s, %zu tokens in total\n",
-            std::chrono::duration<double>(t_end - t_loaded).count(), ids.size());
+    LOG(INFO) << "generation done in "
+              << std::fixed << std::setprecision(2)
+              << std::chrono::duration<double>(t_end - t_loaded).count()
+              << " s, " << ids.size() << " tokens in total";
 
     // ---- 输出：完整 token id 序列（prompt + 生成），空白分隔 ----
     std::ostringstream oss;

@@ -40,3 +40,7 @@ dist/
 *.so
 *.dylib
 frostfall
+
+# Tmp dir
+logs/
+work/

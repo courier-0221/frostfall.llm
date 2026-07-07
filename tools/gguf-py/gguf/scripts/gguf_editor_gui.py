@@ -25,9 +25,9 @@ from PySide6.QtCore import Qt
 if "NO_LOCAL_GGUF" not in os.environ and (Path(__file__).parent.parent.parent.parent / 'gguf-py').exists():
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-import tools.gguf.gguf as gguf
-from tools.gguf.gguf import GGUFReader, GGUFWriter, GGUFValueType, ReaderField
-from tools.gguf.constants import TokenType, RopeScalingType, PoolingType, GGMLQuantizationType
+import gguf
+from gguf import GGUFReader, GGUFWriter, GGUFValueType, ReaderField
+from gguf.constants import TokenType, RopeScalingType, PoolingType, GGMLQuantizationType
 
 logger = logging.getLogger("gguf-editor-gui")
 

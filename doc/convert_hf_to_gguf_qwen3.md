@@ -3,7 +3,7 @@
 > 分析对象：[scripts/convert_hf_to_gguf.py](../scripts/convert_hf_to_gguf.py)（llama.cpp 官方转换脚本，随
 > [scripts/gguf/](../scripts/gguf/) 包一起拷贝进本仓库）。
 >
-> 输入模型：`/home/lil72/data/model/Qwen3-0___6B/`（HF safetensors，bf16）
+> 输入模型：`/path/model/Qwen3-0.6B/`（HF safetensors，bf16）
 > 输出产物：[models/qwen3-0.6b-f16.gguf](../models/qwen3-0.6b-f16.gguf)（约 1.4GB，F16）
 >
 > 本文所有字段/顺序/张量列表均通过 `scripts/gguf/scripts/gguf_dump.py` 对**实际生成的
@@ -17,7 +17,7 @@
 
 ```bash
 conda run -n llm python scripts/convert_hf_to_gguf.py \
-    /home/lil72/data/model/Qwen3-0___6B \
+    /home/lil72/data/model/Qwen3-0.6B \
     --outfile models/qwen3-0.6b-f16.gguf \
     --outtype f16
 ```

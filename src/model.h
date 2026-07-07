@@ -28,7 +28,8 @@ struct qwen3_hparams {
     float   rope_freq_base = 1000000.0f;
 
     // 特殊 token id，v0.1 用来判断生成是否应该停止（分词本身仍由 Python 预处理）。
-    int32_t eos_token_id = -1;
+    int32_t eos_token_id = -1; // <|endoftext|>（151643）
+    int32_t eot_token_id = -1; // <|im_end|>（151645），chat 模式的实际结束符
     int32_t bos_token_id = -1;
 
     // Q/K/V 投影展平后的维度：head_dim * n_head(_kv)，注意不等于 n_embd。

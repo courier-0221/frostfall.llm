@@ -10,6 +10,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Compatibility for people trying to import gguf/gguf.py directly instead of as a package.
 importlib.invalidate_caches()
-import tools.gguf.gguf as gguf  # noqa: E402
+import gguf  # noqa: E402
 
 importlib.reload(gguf)

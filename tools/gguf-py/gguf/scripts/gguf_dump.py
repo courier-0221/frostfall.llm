@@ -13,7 +13,7 @@ from typing import Any
 if "NO_LOCAL_GGUF" not in os.environ and (Path(__file__).parent.parent.parent.parent / 'gguf-py').exists():
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from tools.gguf.gguf import GGUFReader, GGUFValueType, ReaderTensor  # noqa: E402
+from gguf import GGUFReader, GGUFValueType, ReaderTensor  # noqa: E402
 
 logger = logging.getLogger("gguf-dump")
 
