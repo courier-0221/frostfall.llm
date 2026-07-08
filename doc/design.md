@@ -323,17 +323,11 @@ llama.cpp 转换脚本产出的标准命名（`blk.{i}` 为第 i 层）：
 ## 8. 构建、运行与验证
 
 ### 8.1 依赖 ggml
-- 以 **git submodule** 方式引入 ggml，版本锁定 **v0.15.3**：
-
-```bash
-git submodule add https://github.com/ggml-org/ggml.git third_party/ggml
-cd third_party/ggml && git checkout v0.15.3 && cd ../..
-git submodule update --init --recursive
-```
-
+- ggml 源码（版本锁定 **v0.15.3**）直接以普通目录形式存放在 `third_party/ggml` 下，
+  随本仓库一起提交跟踪，不使用 git submodule。
 - CMake 里 `add_subdirectory(third_party/ggml)`，链接 `ggml`、`ggml-cpu`
   （对照 `third_party/ggml/examples/gpt-2/CMakeLists.txt`）。
-- 克隆本仓库时需带子模块：`git clone --recurse-submodules <repo>`。
+- 直接 `git clone` 本仓库即可，无需额外的子模块初始化步骤。
 
 ### 8.2 准备模型（HF → GGUF 转换）
 - 本地 HF 模型：`/home/data/model/Qwen3-0___6B/`（`torch_dtype=bfloat16`，单 `model.safetensors`）。

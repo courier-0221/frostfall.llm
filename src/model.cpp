@@ -4,7 +4,7 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 
-#include <glog/logging.h>
+#include "log.h"
 
 #include <algorithm>
 #include <iomanip>

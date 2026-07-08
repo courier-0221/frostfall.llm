@@ -29,7 +29,7 @@ frostfall.llm/
 │   ├── decode_tokens.py  # token id 文件 -> 文本（依赖 transformers）
 │   └── compare_llamacpp.py  # 与 llama.cpp 对拍验证
 ├── tools/                # gguf 转换脚本
-├── third_party/ggml/     # ggml v0.15.3（git submodule）
+├── third_party/ggml/     # ggml v0.15.3（内置源码，随仓库跟踪）
 ├── doc/design.md         # 完整设计文档
 └── CMakeLists.txt
 ```
@@ -51,7 +51,7 @@ frostfall.llm/
 ## 构建
 
 ```bash
-git clone --recurse-submodules <repo>
+git clone <repo>
 cd frostfall.llm
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -60,8 +60,6 @@ cmake --build build -j$(nproc)
 # 产物
 ./build/frostfall --help
 ```
-
-> 如果已克隆但忘了拉 submodule：`git submodule update --init`
 
 ---
 

@@ -9,14 +9,8 @@ if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# ggml 直接内置在 third_party/ggml 下（暂不使用 git submodule 管理，见 doc/design.md §8.1）
+# ggml 直接内置在 third_party/ggml 下（作为普通目录随本仓库跟踪，不使用 git submodule，见 doc/design.md §8.1）
 add_subdirectory(third_party/ggml)
-
-# glog v0.7.1（git submodule），关闭可选依赖以简化构建
-set(WITH_GFLAGS   OFF CACHE BOOL "" FORCE)
-set(WITH_GTEST    OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-add_subdirectory(third_party/glog)
 
 add_executable(frostfall
     src/main.cpp
@@ -25,4 +19,4 @@ add_executable(frostfall
 )
 
 target_include_directories(frostfall PRIVATE src)
-target_link_libraries(frostfall PRIVATE ggml glog::glog)
+target_link_libraries(frostfall PRIVATE ggml)

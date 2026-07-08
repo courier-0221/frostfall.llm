@@ -12,7 +12,7 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 
-#include <glog/logging.h>
+#include "log.h"
 
 #include <chrono>
 #include <cmath>
@@ -112,9 +112,6 @@ int32_t argmax(const float * logits, int32_t n_vocab) {
 } // namespace
 
 int main(int argc, char ** argv) {
-    google::InitGoogleLogging(argv[0]);
-    FLAGS_logtostderr = true;
-
     cli_args args;
     if (!parse_args(argc, argv, args)) {
         print_usage(argv[0]);
