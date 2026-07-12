@@ -220,3 +220,4 @@ conda run -n llm python scripts/compare_llamacpp.py compare \
 | v0.2 | 自研 BPE Tokenizer + 增量 KV cache + 模块化 | 规划中 |
 | v0.3 | 采样策略：temperature / top-k / top-p | 规划中 |
 | v0.4 | 量化权重（Q4_K/Q8_0）、CUDA backend（选做） | 规划中 |
+| v1.0 | 通用api接口 | 规划中 |

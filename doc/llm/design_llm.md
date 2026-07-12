@@ -170,8 +170,12 @@ frostfall.llm/
 | **v0.1** | 跑通前向主体链路（单 token、贪心解码）+ 对拍验证 | 输入 prompt 能自回归生成通顺文本；与 llama.cpp 同 seed 贪心输出逐 token 一致 |
 | **v0.2** | Tokenizer 自实现 + 增量 KV cache + 模块化/计时 | 不再依赖外部分词；prompt 一次性 prefill、decode 单 token 增量；代码拆模块、有 tokens/s 与内存统计 |
 | **v0.3** | 采样策略 | 支持 temperature / top-k / top-p，可复现随机采样 |
-| **v0.4** | 性能与后端扩展（选做，进阶） | 支持量化权重（Q4_K/Q8_0）、可选 CUDA backend、flash-attention |
+| **v0.4** | 性能与后端扩展（选做，进阶支线） | 支持量化权重（Q4_K/Q8_0）、可选 CUDA backend、flash-attention；与 v1.0 正交，可在其前后任意时机做 |
+| **v1.0** | 通用接口封装（库化，对外 API） | 对外只暴露 init + 推理两类接口；应用层传 message 数组，库内部完成 chat 模板拼接→分词→推理→采样→解码 |
 
+> 主线是 v0.1→v0.2→v0.3→**v1.0**（引擎→库化收口）；v0.4 是与主线正交的**进阶选做支线**（性能优化），
+> 不阻塞 v1.0，也不改变对外接口。
+>
 > 工程化与可观测不单独成版，而是分散到各版本：**对拍脚本**是 v0.1 的验证工具（不能往后拖）；
 > **模块拆分与计时统计**在 v0.2 自然发生（代码变胖 + 要证明提速）；README/注释/错误处理是各版本常规动作。
 
@@ -258,6 +262,20 @@ frostfall.llm/
 - **CUDA backend**：`#ifdef GGML_USE_CUDA` 切换 `ggml_backend_cuda_init()`（对照 gpt-2 示例）。
 - **`ggml_backend_sched`** 多后端调度；**flash-attention**（`ggml_flash_attn_ext`）。
 - batched / 多序列并行（对照 `main-batched.cpp`）。
+
+
+---
+
+### v1.0 —— 通用接口封装（库化，对外 API）
+
+**目标**：把 v0.1–v0.3 的推理内核从 CLI demo **收口成一个稳定、可复用的库**。
+对应用层只暴露最小接口——**初始化 + 推理**；应用层用 `message` 结构描述对话，
+库内部一条龙完成 **chat 模板拼接 → 分词 → 推理 → 采样 → 解码**，
+调用方不需要（也看不到）任何 ggml / 内部张量细节。
+
+> 这是"引擎装进车壳、留出方向盘与油门"的一步，也是本框架从"能跑的 demo"变成
+> "能被别人 `#include` 用起来"的分水岭，因此单独作为 **v1.0（final）**。
+
 
 ---
 
