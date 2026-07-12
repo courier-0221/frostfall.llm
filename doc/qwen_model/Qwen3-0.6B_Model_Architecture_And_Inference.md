@@ -119,46 +119,9 @@
 - Top-p
 - Repetition Penalty
 
-### 第9章：config.json 全参数逐项解析
 
 
-
-### 这部分就是你最开始问的内容
-
-每个参数都会回答：
-
-- 它属于哪一层？
-- shape 是什么？
-- 在推理时什么时候被读取？
-- 在 ggml 中对应哪个张量？
-
-### 第10章：自己实现最小 Qwen 推理框架
-
-
-
-### 最终工程结构（推荐）
-
-mini_qwen/
-
-├── tokenizer.cpp
-
-├── model_loader.cpp
-
-├── rope.cpp
-
-├── attention.cpp
-
-├── mlp.cpp
-
-├── rmsnorm.cpp
-
-├── kvcache.cpp
-
-├── sampler.cpp
-
-└── main.cpp
-
-### 第11章：对照 llama.cpp 源码
+### 第9章：对照 llama.cpp 源码
 
 ![llama.cpp 源码解析_llama cpp-CSDN博客](https://images.openai.com/static-rsc-4/Fb-cZTwp-yThP1euNbu3oW9EdciJSA8wRIryRHWj2u4iIa97HpmYWPqSalCndJu3eRmSIp9yvGMHMj8NDXsDCV7sxXREExVjRuOuDxwDLb_h0UPPeG3ZSz3ZGx9Fo86bI9GujqmpV1seZun5Q7Zy5CMpHO1fie9sVO5Igk59JBJOekpO6Dxz9F_jUgSSQn7s?purpose=fullsize)
 
