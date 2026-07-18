@@ -16,6 +16,9 @@ add_executable(frostfall
     src/main.cpp
     src/model.cpp
     src/graph.cpp
+    src/kv_cache.cpp
+    src/tokenizer.cpp
+    src/common.cpp
 )
 
 target_include_directories(frostfall PRIVATE src)

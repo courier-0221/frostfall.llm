@@ -2,17 +2,21 @@
 
 > 基于 **ggml v0.15.3** 的极简教学版大模型推理框架，唯一目标模型：**Qwen3-0.6B**。
 >
-> 设计目标：用尽量少、尽量清晰的 C++ 代码，把"加载模型 → 构图 → 前向 → 贪心解码"的完整链路跑通，
+> 设计目标：用尽量少、尽量清晰的 C++ 代码，把"加载模型 → 分词 → 构图 → 前向 → 增量解码"的完整链路跑通，
 > 替代 llama.cpp 用于原理学习。详细设计见 [doc/design.md](doc/design.md)。
 
 ---
 
-## 当前版本：v0.1
+## 当前版本：v0.2
 
-v0.1 的两个简化（后续版本会逐步去掉）：
+相比 v0.1，v0.2 去掉了两个简化：
 
-1. **Tokenizer 由 Python 预处理**：用 `scripts/encode_prompt.py` 把文本编成 token id 文件，C++ 端直接读；生成结果同样用 Python 反解码。
-2. **无增量 KV cache**：每一步都把当前完整 token 序列重新前向一遍（O(n²)，但最简单、最不易出 bug），增量 KV cache 推迟到 v0.2。
+1. **自研 Tokenizer**：不再依赖 Python 预处理 token id 文件，`src/tokenizer.{h,cpp}` 直接从 GGUF 元数据里读取词表 / BPE merges / 特殊 token，实现 byte-level BPE 的 encode/decode，命令行用 `-p` 直接传文本即可。
+2. **增量 KV cache**：`src/kv_cache.{h,cpp}` 实现了朴素的连续内存 KV cache，prompt 阶段一次性 prefill，之后每步只前向 1 个新 token（K/V 增量追加），复杂度从 O(n²) 降到 O(n)。
+
+此外还新增了计时统计（加载/prefill/decode 耗时、tokens/s）与内存占用（权重 / KV cache）打印。
+
+`-i`/`-o`（token id 文件）接口仍然保留，供 `scripts/compare_llamacpp.py` 对拍脚本使用。
 
 ---
 
@@ -21,16 +25,20 @@ v0.1 的两个简化（后续版本会逐步去掉）：
 ```
 frostfall.llm/
 ├── src/
-│   ├── main.cpp          # CLI 入口，推理主循环
+│   ├── main.cpp          # CLI 入口，加载 -> 分词 -> prefill -> decode 主循环
+│   ├── common.{h,cpp}    # 计时器、chat 模板、字节数格式化
 │   ├── model.{h,cpp}     # GGUF 加载，qwen3_model 权重结构体
-│   └── graph.{h,cpp}     # qwen3_build_graph()，搭出 Qwen3 前向计算图
+│   ├── graph.{h,cpp}     # qwen3_build_graph()，搭出 Qwen3 前向计算图
+│   ├── kv_cache.{h,cpp}  # 增量 KV cache
+│   └── tokenizer.{h,cpp} # 自研 byte-level BPE 分词器（从 GGUF 元数据构建）
 ├── scripts/
-│   ├── encode_prompt.py  # 文本 -> token id 文件（依赖 transformers）
-│   ├── decode_tokens.py  # token id 文件 -> 文本（依赖 transformers）
+│   ├── encode_prompt.py     # 文本 -> token id 文件（仅供对拍脚本使用，依赖 transformers）
+│   ├── decode_tokens.py     # token id 文件 -> 文本（仅供对拍脚本使用，依赖 transformers）
 │   └── compare_llamacpp.py  # 与 llama.cpp 对拍验证
 ├── tools/                # gguf 转换脚本
 ├── third_party/ggml/     # ggml v0.15.3（内置源码，随仓库跟踪）
 ├── doc/design.md         # 完整设计文档
+├── doc/code_analysis_v0.2.md  # v0.2 逐接口代码走读
 └── CMakeLists.txt
 ```
 
@@ -38,13 +46,19 @@ frostfall.llm/
 
 ## 环境依赖
 
+推理本身（构建 + 运行 `frostfall`）只需要 C++ 工具链，**不再需要 Python**：
+
 | 依赖 | 说明 |
 | --- | --- |
 | CMake ≥ 3.14 | 构建系统 |
 | C++17 编译器 | GCC 9+ 或 Clang 10+ |
-| Python 3.8+ | 仅用于 tokenizer 预处理脚本 |
-| `transformers` | `pip install transformers` |
-| Qwen3-0.6B HF 模型 | 用于 tokenizer；转换为 GGUF 后推理 |
+
+以下依赖仅在做 HF → GGUF 转换 或 与 llama.cpp 对拍验证 时才需要：
+
+| 依赖 | 说明 |
+| --- | --- |
+| Python 3.8+ / `transformers` | 仅用于 `tools/convert_hf_to_gguf.py` 转换模型，以及对拍脚本 `scripts/compare_llamacpp.py` |
+| Qwen3-0.6B HF 模型 | 转换为 GGUF 后推理，或对拍时提供"标准答案" tokenizer |
 
 ---
 
@@ -65,10 +79,10 @@ cmake --build build -j$(nproc)
 
 ## 准备模型（HF → GGUF）
 
-推理需要 F16 GGUF 格式，用 llama.cpp 的转换脚本生成：
+推理需要 F16 GGUF 格式，用 llama.cpp 的转换脚本生成（GGUF 中会内置 tokenizer 元数据，v0.2 推理时无需再依赖 HF 模型目录）：
 
 ```bash
-python /path/to/convert_hf_to_gguf.py \
+python tools/convert_hf_to_gguf.py \
     /path/to/Qwen3-0.6B \
     --outfile models/qwen3-0.6b-f16.gguf \
     --outtype f16
@@ -76,58 +90,52 @@ python /path/to/convert_hf_to_gguf.py \
 
 ---
 
-## 使用（v0.1 三步流程）
+## 使用（v0.2：一条命令直接推理）
 
-### 第一步：编码 prompt → token id 文件
+`-p` 直接传文本即可，默认套用 Qwen3 chat 模板；生成结果逐 token 流式打印到 stdout。
 
 ```bash
-# 套用 Qwen3 chat 模板（推荐）
+./build/frostfall \
+    -m models/qwen3-0.6b-f16.gguf \
+    -p "你好，介绍一下你自己" \
+    -n 128 \
+    -t 4
+```
+
+其他常用用法：
+
+```bash
+# 不套 chat 模板，直接对纯文本编码（对拍脚本用）
+./build/frostfall -m models/qwen3-0.6b-f16.gguf -p "Hello" -n 32 --no-chat-template
+
+# 开启 Qwen3 思考模式（<think> ... </think>）
+./build/frostfall -m models/qwen3-0.6b-f16.gguf -p "1+1等于几" -n 128 --think
+
+# 限制 KV cache 上下文长度（默认 4096）
+./build/frostfall -m models/qwen3-0.6b-f16.gguf -p "你好" -n 64 -c 2048
+```
+
+进度、计时统计（加载/prefill/decode 耗时、tokens/s）和内存占用打印到 stderr，生成文本流式打印到 stdout。
+
+### 兼容模式：token id 文件输入输出（供对拍脚本使用）
+
+仍可用 `-i`/`-o` 跳过自带分词器，直接读写 token id 文件（配合 `scripts/encode_prompt.py` / `scripts/decode_tokens.py`）：
+
+```bash
 python scripts/encode_prompt.py \
     --model /path/to/Qwen3-0.6B \
     --prompt "你好，介绍一下你自己" \
     --out logs/tokens_in.txt
 
-# 不套 chat 模板，直接编码纯文本（对拍脚本用）
-python scripts/encode_prompt.py \
-    --model /path/to/Qwen3-0.6B \
-    --prompt "Hello" \
-    --out logs/tokens_in.txt \
-    --no-chat-template
-
-# 开启 Qwen3 思考模式（<think> ... </think>）
-python scripts/encode_prompt.py \
-    --model /path/to/Qwen3-0.6B \
-    --prompt "1+1等于几" \
-    --out logs/tokens_in.txt \
-    --enable-thinking
-```
-
-### 第二步：推理
-
-```bash
 ./build/frostfall \
     -m models/qwen3-0.6b-f16.gguf \
     -i logs/tokens_in.txt \
     -o logs/tokens_out.txt \
-    -n 128 \
-    -t 4
-```
+    -n 128 -t 4
 
-进度和计时打印到 stderr，完整 token id 序列（prompt + 生成）打印到 stdout 并写入 `-o` 文件。
-
-### 第三步：解码 token id → 文本
-
-```bash
-# 查看完整输出（含 prompt）
 python scripts/decode_tokens.py \
     --model /path/to/Qwen3-0.6B \
     --ids-file logs/tokens_out.txt
-
-# 只看新生成的部分（需告知 prompt 长度）
-python scripts/decode_tokens.py \
-    --model /path/to/Qwen3-0.6B \
-    --ids-file logs/tokens_out.txt \
-    --prompt-len $(wc -w < tokens_in.txt)
 ```
 
 ---
@@ -135,15 +143,19 @@ python scripts/decode_tokens.py \
 ## CLI 参数说明
 
 ```
-frostfall v0.1 - 基于 ggml 的 Qwen3-0.6B 教学版推理框架
+frostfall v0.2 - 基于 ggml 的 Qwen3-0.6B 教学版推理框架（自研分词 + 增量 KV cache）
 
-usage: frostfall -m <model.gguf> -i <tokens_in.txt> [-o <tokens_out.txt>] [-n N] [-t N]
+usage: frostfall -m <model.gguf> (-p <prompt> | -i <tokens_in.txt>) [options]
 
-  -m, --model       FILE   Qwen3 GGUF 模型路径（必填）
-  -i, --tokens-in   FILE   prompt 的 token id 文件，空白分隔的整数（必填）
-  -o, --tokens-out  FILE   生成结果（完整 token id 序列）写入此文件（可选）
-  -n, --n-predict   N      最多生成多少个新 token（默认 64）
-  -t, --threads     N      CPU 计算线程数（默认 4）
+  -m, --model        FILE  Qwen3 GGUF 模型路径（必填）
+  -p, --prompt       TEXT  用户输入文本（自研分词器编码；默认套 Qwen3 chat 模板）
+  -i, --tokens-in    FILE  改为读入空白分隔的 token id（兼容对拍脚本，与 -p 二选一）
+  -o, --tokens-out   FILE  把完整 token id 序列（prompt+生成）写入此文件（可选）
+  -n, --n-predict    N     最多生成多少个新 token（默认 64）
+  -c, --ctx-size     N     KV cache 上下文上限（默认 4096）
+  -t, --threads      N     CPU 计算线程数（默认 4）
+      --no-chat-template   不套 chat 模板，直接对 -p 的纯文本编码
+      --think              启用 Qwen3 思考模式（默认关闭）
 ```
 
 ---
@@ -216,7 +228,8 @@ conda run -n llm python scripts/compare_llamacpp.py compare \
 
 | 版本 | 主题 | 状态 |
 | --- | --- | --- |
-| **v0.1** | 主体链路：加载 → 构图 → 前向 → 贪心解码 + 对拍验证 | ✅ 当前版本 |
-| v0.2 | 自研 BPE Tokenizer + 增量 KV cache + 模块化 | 规划中 |
+| v0.1 | 主体链路：加载 → 构图 → 前向 → 贪心解码 + 对拍验证 | ✅ 已完成 |
+| **v0.2** | 自研 BPE Tokenizer + 增量 KV cache + 计时/内存统计 | ✅ 当前版本 |
 | v0.3 | 采样策略：temperature / top-k / top-p | 规划中 |
 | v0.4 | 量化权重（Q4_K/Q8_0）、CUDA backend（选做） | 规划中 |
+| v1.0 | 通用api接口 | 规划中 |
