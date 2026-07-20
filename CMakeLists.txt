@@ -18,6 +18,7 @@ add_executable(frostfall
     src/graph.cpp
     src/kv_cache.cpp
     src/tokenizer.cpp
+    src/sampler.cpp
     src/common.cpp
 )
 

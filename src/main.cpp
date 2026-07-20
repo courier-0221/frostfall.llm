@@ -1,18 +1,19 @@
-// frostfall v0.2 —— 自研分词器 + 增量 KV cache + 计时统计。
+// frostfall v0.3 —— 在 v0.2（自研分词器 + 增量 KV cache + 计时统计）上新增采样策略。
 //
 // 主链路：加载 GGUF -> 构建 tokenizer -> 文本 encode -> prefill(一次性整段) ->
-//         decode(每步 1 个 token，K/V 增量追加) -> argmax 贪心 -> 流式解码打印。
+//         decode(每步 1 个 token，K/V 增量追加) -> 采样（贪心 / temperature / top-k / top-p） -> 流式解码打印。
 //
-// 相比 v0.1 的变化：
-//   1. 分词自己做（src/tokenizer.*），不再依赖 Python 预处理；用 -p 直接传文本。
-//   2. 增量 KV cache（src/kv_cache.*），复杂度从 O(n^2) 降到 O(n)。
-//   3. 打印各阶段耗时、tokens/s，以及权重 / KV cache 内存占用。
+// 相比 v0.2 的变化：
+//   1. 新增采样模块（src/sampler.*）：支持 temperature / top-k / top-p / 重复惩罚，可设随机种子。
+//   2. CLI 暴露 --temp / --top-k / --top-p / --seed / --repeat-penalty / --repeat-last-n。
+//   3. --temp 0（默认）时退化为贪心解码，输出与 v0.2 完全一致（对拍不受影响）。
 //   4. 仍保留 -i/-o（token id 文件）以兼容对拍脚本 scripts/compare_llamacpp.py。
 
 #include "common.h"
 #include "graph.h"
 #include "kv_cache.h"
 #include "model.h"
+#include "sampler.h"
 #include "tokenizer.h"
 
 #include "ggml-alloc.h"
@@ -45,11 +46,13 @@ struct cli_args {
     bool        no_chat      = false; // 不套 chat 模板，直接对纯文本编码
     bool        enable_think = false; // Qwen3 chat 模板是否启用思考模式
     bool        has_prompt   = false;
+
+    sampler_params sampling;          // 采样参数（默认 temp=0 => 贪心，与 v0.2 一致）
 };
 
 void print_usage(const char * prog) {
     fprintf(stderr,
-        "frostfall v0.2 - 基于 ggml 的 Qwen3-0.6B 教学版推理框架（自研分词 + 增量 KV cache）\n"
+        "frostfall v0.3 - 基于 ggml 的 Qwen3-0.6B 教学版推理框架（自研分词 + 增量 KV cache + 采样策略）\n"
         "\n"
         "usage: %s -m <model.gguf> (-p <prompt> | -i <tokens_in.txt>) [options]\n"
         "\n"
@@ -61,7 +64,15 @@ void print_usage(const char * prog) {
         "  -c, --ctx-size     N     KV cache 上下文上限（默认 4096）\n"
         "  -t, --threads      N     CPU 计算线程数（默认 4）\n"
         "      --no-chat-template   不套 chat 模板，直接对 -p 的纯文本编码\n"
-        "      --think              启用 Qwen3 思考模式（默认关闭）\n",
+        "      --think              启用 Qwen3 思考模式（默认关闭）\n"
+        "\n"
+        " 采样选项（默认贪心解码）：\n"
+        "      --temp         F     采样温度，<=0 表示贪心 argmax（默认 0）\n"
+        "      --top-k        N     只在 logit 最高的 N 个候选里采样，<=0 关闭（默认 0）\n"
+        "      --top-p        F     nucleus 采样累计概率阈值，>=1 关闭（默认 1.0）\n"
+        "      --seed         N     随机种子，可复现采样；不指定则每次随机\n"
+        "      --repeat-penalty F   重复惩罚系数，1.0 关闭（默认 1.0）\n"
+        "      --repeat-last-n  N   重复惩罚回看窗口，<0 表示整段历史（默认 64）\n",
         prog);
 }
 
@@ -81,6 +92,12 @@ bool parse_args(int argc, char ** argv, cli_args & args) {
         else if (arg == "-t" || arg == "--threads")    args.n_threads = std::stoi(next_value(arg.c_str()));
         else if (arg == "--no-chat-template")          args.no_chat = true;
         else if (arg == "--think")                     args.enable_think = true;
+        else if (arg == "--temp")                      args.sampling.temp = std::stof(next_value(arg.c_str()));
+        else if (arg == "--top-k")                     args.sampling.top_k = std::stoi(next_value(arg.c_str()));
+        else if (arg == "--top-p")                     args.sampling.top_p = std::stof(next_value(arg.c_str()));
+        else if (arg == "--seed")                      args.sampling.seed = (uint32_t) std::stoul(next_value(arg.c_str()));
+        else if (arg == "--repeat-penalty")            args.sampling.repeat_penalty = std::stof(next_value(arg.c_str()));
+        else if (arg == "--repeat-last-n")             args.sampling.repeat_last_n = std::stoi(next_value(arg.c_str()));
         else if (arg == "-h" || arg == "--help")       { print_usage(argv[0]); exit(0); }
         else { LOG(ERROR) << "unknown argument '" << arg << "'"; return false; }
     }
@@ -97,15 +114,6 @@ std::vector<int32_t> read_token_ids(const std::string & path) {
     int32_t v;
     while (fin >> v) ids.push_back(v);
     return ids;
-}
-
-int32_t argmax(const float * logits, int32_t n) {
-    int32_t best = 0;
-    float best_val = -std::numeric_limits<float>::infinity();
-    for (int32_t i = 0; i < n; ++i) {
-        if (logits[i] > best_val) { best_val = logits[i]; best = i; }
-    }
-    return best;
 }
 
 } // namespace
@@ -160,6 +168,19 @@ int main(int argc, char ** argv) {
     qwen3_kv_cache kv;
     if (!kv.init(model, n_ctx)) return 1;
 
+    // ---- 采样器：默认 temp=0（贪心，等价 v0.2）；否则走 temperature/top-k/top-p 采样链。----
+    sampler smpl;
+    smpl.init(args.sampling);
+    if (args.sampling.temp <= 0.0f) {
+        LOG(INFO) << "sampling: greedy (temp<=0)";
+    } else {
+        LOG(INFO) << "sampling: temp=" << smpl.params.temp
+                  << ", top_k=" << smpl.params.top_k
+                  << ", top_p=" << smpl.params.top_p
+                  << ", repeat_penalty=" << smpl.params.repeat_penalty
+                  << ", seed=" << smpl.params.seed;
+    }
+
     const int32_t n_vocab   = model.hparams.n_vocab;
     const int     max_nodes = 8192;
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
@@ -167,7 +188,7 @@ int main(int argc, char ** argv) {
     std::vector<float>   mask_buf;
     std::vector<int32_t> pos_buf;
 
-    // 前向一个 batch：把 [batch(n 个)] 写入 cache 的 [n_past, n_past+n)，返回“最后一个位置”的 argmax。
+    // 前向一个 batch：把 [batch(n 个)] 写入 cache 的 [n_past, n_past+n)，对“最后一个位置”的 logits 采样返回下一个 token。
     auto eval_batch = [&](const int32_t * batch, int32_t n, int32_t n_past) -> int32_t {
         const int32_t n_kv = n_past + n;
 
@@ -208,7 +229,8 @@ int main(int argc, char ** argv) {
 
         ggml_free(ctx);
         kv.n_past = n_kv; // cache 里现在有 n_kv 个有效 token
-        return argmax(logits.data(), n_vocab);
+        // ids 是“到目前为止的完整序列”（尚未追加本次采样结果），正好作为重复惩罚的回看历史。
+        return smpl.sample(logits.data(), n_vocab, ids);
     };
 
     // ---- 4. prefill：一次性前向整段 prompt ----

@@ -7,16 +7,17 @@
 
 ---
 
-## 当前版本：v0.2
+## 当前版本：v0.3
 
-相比 v0.1，v0.2 去掉了两个简化：
+v0.3 在 v0.2（自研分词 + 增量 KV cache + 计时统计）的基础上新增了**采样策略**：
 
-1. **自研 Tokenizer**：不再依赖 Python 预处理 token id 文件，`src/tokenizer.{h,cpp}` 直接从 GGUF 元数据里读取词表 / BPE merges / 特殊 token，实现 byte-level BPE 的 encode/decode，命令行用 `-p` 直接传文本即可。
-2. **增量 KV cache**：`src/kv_cache.{h,cpp}` 实现了朴素的连续内存 KV cache，prompt 阶段一次性 prefill，之后每步只前向 1 个新 token（K/V 增量追加），复杂度从 O(n²) 降到 O(n)。
+- **采样模块** `src/sampler.{h,cpp}`：支持一条常见的采样链 `重复惩罚 → top-k → temperature+softmax → top-p → 按概率随机采样`，每一步都可单独关闭。
+- **可复现随机采样**：可通过 `--seed` 固定随机种子；不指定时运行时随机取一个并打进日志，便于复现。
+- **默认即贪心**：不带采样参数时 `--temp 0`，退化为贪心 argmax，输出与 v0.2 逐 token 一致（对拍验证不受影响）。
 
-此外还新增了计时统计（加载/prefill/decode 耗时、tokens/s）与内存占用（权重 / KV cache）打印。
+v0.2 的自研 Tokenizer、增量 KV cache、计时/内存统计、`-i`/`-o`（token id 文件）对拍接口均保留不变。
 
-`-i`/`-o`（token id 文件）接口仍然保留，供 `scripts/compare_llamacpp.py` 对拍脚本使用。
+> v0.2 的功能说明详见下文与 [doc/code_analysis_v0.2.md](doc/code_analysis_v0.2.md)；v0.3 采样实现的逐接口走读见 [doc/code_analysis_v0.3.md](doc/code_analysis_v0.3.md)。
 
 ---
 
@@ -30,7 +31,8 @@ frostfall.llm/
 │   ├── model.{h,cpp}     # GGUF 加载，qwen3_model 权重结构体
 │   ├── graph.{h,cpp}     # qwen3_build_graph()，搭出 Qwen3 前向计算图
 │   ├── kv_cache.{h,cpp}  # 增量 KV cache
-│   └── tokenizer.{h,cpp} # 自研 byte-level BPE 分词器（从 GGUF 元数据构建）
+│   ├── tokenizer.{h,cpp} # 自研 byte-level BPE 分词器（从 GGUF 元数据构建）
+│   └── sampler.{h,cpp}   # 采样策略（greedy / temperature / top-k / top-p / 重复惩罚）
 ├── scripts/
 │   ├── encode_prompt.py     # 文本 -> token id 文件（仅供对拍脚本使用，依赖 transformers）
 │   ├── decode_tokens.py     # token id 文件 -> 文本（仅供对拍脚本使用，依赖 transformers）
@@ -39,6 +41,7 @@ frostfall.llm/
 ├── third_party/ggml/     # ggml v0.15.3（内置源码，随仓库跟踪）
 ├── doc/design.md         # 完整设计文档
 ├── doc/code_analysis_v0.2.md  # v0.2 逐接口代码走读
+├── doc/code_analysis_v0.3.md  # v0.3 采样策略逐接口走读
 └── CMakeLists.txt
 ```
 
@@ -90,9 +93,10 @@ python tools/convert_hf_to_gguf.py \
 
 ---
 
-## 使用（v0.2：一条命令直接推理）
+## 使用（一条命令直接推理）
 
 `-p` 直接传文本即可，默认套用 Qwen3 chat 模板；生成结果逐 token 流式打印到 stdout。
+默认走**贪心解码**（`--temp 0`），输出确定、可与 llama.cpp 对拍。
 
 ```bash
 ./build/frostfall \
@@ -114,6 +118,37 @@ python tools/convert_hf_to_gguf.py \
 # 限制 KV cache 上下文长度（默认 4096）
 ./build/frostfall -m models/qwen3-0.6b-f16.gguf -p "你好" -n 64 -c 2048
 ```
+
+### 采样（v0.3 新增）
+
+默认 `--temp 0` 为贪心解码。传入采样参数即可开启随机采样，让输出更有多样性：
+
+```bash
+# temperature + top-k + top-p 采样（典型 Qwen3 采样配置）
+./build/frostfall -m models/qwen3-0.6b-f16.gguf -p "写一首关于秋天的短诗" -n 128 \
+    --temp 0.8 --top-k 20 --top-p 0.95
+
+# 固定随机种子 -> 输出可复现（同一 seed 每次结果一致）
+./build/frostfall -m models/qwen3-0.6b-f16.gguf -p "讲个笑话" -n 128 \
+    --temp 0.8 --top-k 20 --top-p 0.95 --seed 42
+
+# 开启重复惩罚，抑制近期重复的 token
+./build/frostfall -m models/qwen3-0.6b-f16.gguf -p "介绍一下你自己" -n 128 \
+    --temp 0.8 --repeat-penalty 1.1 --repeat-last-n 64
+```
+
+采样参数说明：
+
+| 参数 | 含义 | 默认 | 关闭取值 |
+| --- | --- | --- | --- |
+| `--temp` | 采样温度，越大越随机；`<=0` 退化为贪心 argmax | `0` | `<=0`（贪心） |
+| `--top-k` | 只在 logit 最高的 N 个候选里采样 | `0` | `<=0` |
+| `--top-p` | nucleus 采样：保留累计概率达到 P 的最小候选集 | `1.0` | `>=1.0` |
+| `--seed` | 随机种子，固定后输出可复现；不指定则每次随机（真实种子会打进日志） | 随机 | — |
+| `--repeat-penalty` | 重复惩罚系数，`>1` 抑制近期出现过的 token | `1.0` | `1.0` |
+| `--repeat-last-n` | 重复惩罚回看窗口；`<0` 表示整段历史 | `64` | — |
+
+> `--temp 0`（默认）时其余采样参数被忽略，输出与 v0.2 逐 token 一致，因此对拍验证不受影响。
 
 进度、计时统计（加载/prefill/decode 耗时、tokens/s）和内存占用打印到 stderr，生成文本流式打印到 stdout。
 
@@ -143,7 +178,7 @@ python scripts/decode_tokens.py \
 ## CLI 参数说明
 
 ```
-frostfall v0.2 - 基于 ggml 的 Qwen3-0.6B 教学版推理框架（自研分词 + 增量 KV cache）
+frostfall v0.3 - 基于 ggml 的 Qwen3-0.6B 教学版推理框架（自研分词 + 增量 KV cache + 采样策略）
 
 usage: frostfall -m <model.gguf> (-p <prompt> | -i <tokens_in.txt>) [options]
 
@@ -156,6 +191,14 @@ usage: frostfall -m <model.gguf> (-p <prompt> | -i <tokens_in.txt>) [options]
   -t, --threads      N     CPU 计算线程数（默认 4）
       --no-chat-template   不套 chat 模板，直接对 -p 的纯文本编码
       --think              启用 Qwen3 思考模式（默认关闭）
+
+ 采样选项（默认贪心解码）：
+      --temp         F     采样温度，<=0 表示贪心 argmax（默认 0）
+      --top-k        N     只在 logit 最高的 N 个候选里采样，<=0 关闭（默认 0）
+      --top-p        F     nucleus 采样累计概率阈值，>=1 关闭（默认 1.0）
+      --seed         N     随机种子，可复现采样；不指定则每次随机
+      --repeat-penalty F   重复惩罚系数，1.0 关闭（默认 1.0）
+      --repeat-last-n  N   重复惩罚回看窗口，<0 表示整段历史（默认 64）
 ```
 
 ---
@@ -229,6 +272,7 @@ conda run -n llm python scripts/compare_llamacpp.py compare \
 | 版本 | 主题 | 状态 |
 | --- | --- | --- |
 | v0.1 | 主体链路：加载 → 构图 → 前向 → 贪心解码 + 对拍验证 | ✅ 已完成 |
-| **v0.2** | 自研 BPE Tokenizer + 增量 KV cache + 计时/内存统计 | ✅ 当前版本 |
-| v0.3 | 采样策略：temperature / top-k / top-p | 规划中 |
+| v0.2 | 自研 BPE Tokenizer + 增量 KV cache + 计时/内存统计 | ✅ 已完成 |
+| **v0.3** | 采样策略：temperature / top-k / top-p / 重复惩罚 / 可复现 seed | ✅ 当前版本 |
 | v0.4 | 量化权重（Q4_K/Q8_0）、CUDA backend（选做） | 规划中 |
+| v1.0 | 通用api接口 | 规划中 |
