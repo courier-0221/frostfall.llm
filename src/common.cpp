@@ -2,8 +2,6 @@
 
 #include <cstdio>
 
-namespace ff {
-
 std::string format_mb(size_t bytes) {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%.2f MB", bytes / 1024.0 / 1024.0);
@@ -22,5 +20,3 @@ std::string apply_chat_template(const std::string & user, bool enable_thinking) 
     }
     return s;
 }
-
-} // namespace ff

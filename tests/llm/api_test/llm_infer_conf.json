@@ -1,0 +1,14 @@
+{
+  "model_path": "models/qwen3-0.6b-f16.gguf",
+  "n_ctx": 4096,
+  "n_threads": 4,
+  "max_tokens": 512,
+  "sampling": {
+    "temp": 0.0,
+    "top_k": 0,
+    "top_p": 1.0,
+    "repeat_penalty": 1.0,
+    "repeat_last_n": 64,
+    "seed": 42
+  }
+}
