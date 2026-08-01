@@ -29,8 +29,8 @@ add_library(frostfall SHARED ${FROSTFALL_CORE_SOURCES})
 target_include_directories(frostfall PUBLIC src third_party)
 target_link_libraries(frostfall PUBLIC ggml Threads::Threads)
 
-# ---- 测试：链接 frostfall 库的使用示例 / 用例 ----
-option(FROSTFALL_BUILD_TESTS "Build frostfall test executables" ON)
-if (FROSTFALL_BUILD_TESTS)
-    add_subdirectory(tests/llm/api_test)
+# ---- 调用示例：链接 frostfall 库的端到端示例程序 ----
+option(FROSTFALL_BUILD_EXAMPLES "Build frostfall example executables" ON)
+if (FROSTFALL_BUILD_EXAMPLES)
+    add_subdirectory(examples/llm/api_test)
 endif()

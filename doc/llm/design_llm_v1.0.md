@@ -127,7 +127,7 @@ splitter 检查 buffer 末尾是否是 `</think>` 的**前缀**，若是就把�
 
 ---
 
-## 3. Message 的构造与使用（参考 tests/llm/api_test）
+## 3. Message 的构造与使用（参考 examples/llm/api_test）
 
 `Message` 结构（`llm_types.h`）：
 
@@ -227,9 +227,9 @@ engine.Infer(req, [](LlmResponse& chunk) {
 
 ---
 
-## 4. 端到端测试
+## 4. 端到端调用示例
 
-测试位于 `tests/llm/api_test/`，按 thinking 开/关 × 流式/非流式分组，公共逻辑在
+示例位于 `examples/llm/api_test/`，按 thinking 开/关 × 流式/非流式分组，公共逻辑在
 `infer_test_util.h`（打印、统计、CLI 解析、流式帧互斥校验、runner）。
 
 | 文件 | stream | enable_thinking | 覆盖 |

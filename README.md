@@ -10,7 +10,7 @@
 
 v1.0 在 v0.3（自研分词 + 增量 KV cache + 采样策略）的基础上，把"命令行 demo"升级为
 **可被业务集成的通用推理接口**：命令行程序 `frostfall` 已下线，仓库产出改为共享库
-`libfrostfall.so` + 一组调用示例（`tests/llm/api_test`）。
+`libfrostfall.so` + 一组调用示例（`examples/llm/api_test`）。
 
 - **统一推理接口** `Frostfall::InferenceEngine`：一个 `Infer()` 同时覆盖流式 / 非流式，签名对齐
   OpenAI Chat Completions 的语义（`role`、`finish_reason`、`tool_calls`）。
@@ -41,7 +41,7 @@ frostfall.llm/
 │   ├── sampler.{h,cpp}           # 采样策略（greedy / temperature / top-k / top-p / 重复惩罚）
 │   ├── common.{h,cpp}            # 计时器、字节数格式化等工具
 │   └── log.h                     # 日志宏
-├── tests/llm/api_test/           # 链接 frostfall 库的端到端调用示例（同时也是 CMake target）
+├── examples/llm/api_test/          # 链接 frostfall 库的端到端调用示例（同时也是 CMake target）
 │   ├── infer_nothink_blocking.cpp  # 非流式 + 关闭思考：单轮/工具调用/多轮
 │   ├── infer_nothink_stream.cpp    # 流式 + 关闭思考：单轮/工具调用/多轮
 │   ├── infer_yesthink_blocking.cpp # 非流式 + 开启思考
@@ -62,7 +62,7 @@ frostfall.llm/
 
 ## 环境依赖
 
-构建库本身与全部测试可执行文件只需要 C++ 工具链：
+构建库本身与全部示例可执行文件只需要 C++ 工具链：
 
 | 依赖 | 说明 |
 | --- | --- |
@@ -89,7 +89,7 @@ cmake --build build -j$(nproc)
 
 # 产物
 ./build/libfrostfall.so                             # 共享库
-./build/tests/llm/api_test/infer_nothink_blocking    # 调用示例可执行文件（共 4 个）
+./build/examples/llm/api_test/infer_nothink_blocking    # 调用示例可执行文件（共 4 个）
 ```
 
 ---
@@ -141,7 +141,7 @@ python tools/convert_hf_to_gguf.py \
 using namespace Frostfall;
 
 InferenceEngine engine;
-if (!engine.InitFromJsonFile("tests/llm/api_test/llm_infer_conf.json")) {
+if (!engine.InitFromJsonFile("examples/llm/api_test/llm_infer_conf.json")) {
     // 加载模型/初始化失败
 }
 ```
@@ -215,22 +215,22 @@ InferenceStats s = engine.GetLastStats();  // prompt/gen 吞吐、TTFT 等（调
 ```
 
 更完整的用例（单轮 / 工具调用 / 多轮，流式与非流式、开启与关闭思考模式的全组合）见
-`tests/llm/api_test/` 下的四个 `.cpp` 文件。
+`examples/llm/api_test/` 下的四个 `.cpp` 文件。
 
 ---
 
-## 运行调用示例（tests/llm/api_test）
+## 运行调用示例（examples/llm/api_test）
 
 每个 `.cpp` 编译成独立可执行文件，统一读取 JSON 配置文件、可选只跑某一个用例：
 
 ```bash
-./build/tests/llm/api_test/infer_nothink_blocking --config tests/llm/api_test/llm_infer_conf.json
-./build/tests/llm/api_test/infer_nothink_stream   --config tests/llm/api_test/llm_infer_conf.json
-./build/tests/llm/api_test/infer_yesthink_blocking --config tests/llm/api_test/llm_infer_conf.json
-./build/tests/llm/api_test/infer_yesthink_stream   --config tests/llm/api_test/llm_infer_conf.json
+./build/examples/llm/api_test/infer_nothink_blocking --config examples/llm/api_test/llm_infer_conf.json
+./build/examples/llm/api_test/infer_nothink_stream   --config examples/llm/api_test/llm_infer_conf.json
+./build/examples/llm/api_test/infer_yesthink_blocking --config examples/llm/api_test/llm_infer_conf.json
+./build/examples/llm/api_test/infer_yesthink_stream   --config examples/llm/api_test/llm_infer_conf.json
 
 # 只跑指定编号的用例（1=简单单轮 2=Tool Calling 3=多轮）
-./build/tests/llm/api_test/infer_nothink_blocking --config tests/llm/api_test/llm_infer_conf.json --test 2
+./build/examples/llm/api_test/infer_nothink_blocking --config examples/llm/api_test/llm_infer_conf.json --test 2
 ```
 
 ---
