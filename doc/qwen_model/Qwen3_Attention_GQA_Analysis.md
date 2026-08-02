@@ -399,7 +399,7 @@ flowchart TD
 
 ### 8.2 对照 `graph.cpp` 源码通读一遍
 
-以下是仓库当前实现里 Attention 部分的完整代码（[src/graph.cpp](../../src/graph.cpp) 第 43~94 行），
+以下是仓库当前实现里 Attention 部分的完整代码（[src/llm/graph.cpp](../../src/llm/graph.cpp) 第 43~94 行），
 把 §2~§7 的每一步在源码里的确切位置对照一遍：
 
 ```cpp

@@ -20,7 +20,7 @@ logits ──► 重复惩罚 ──► top-k 截断 ──► temperature+softm
 
 | 文件 | 职责 | v0.3 变化 |
 | --- | --- | --- |
-| **[sampler.h](../src/sampler.h) / [sampler.cpp](../src/sampler.cpp)** | 采样策略（greedy / temperature / top-k / top-p / 重复惩罚） | **新增** |
+| **[sampler.h](../src/llm/sampler.h) / [sampler.cpp](../src/llm/sampler.cpp)** | 采样策略（greedy / temperature / top-k / top-p / 重复惩罚） | **新增** |
 | [main.cpp](../src/main.cpp) | 主链路 | **改：CLI 采样参数 + 用采样器替换 argmax** |
 | [CMakeLists.txt](../CMakeLists.txt) | 构建 | **改：加入 `src/sampler.cpp`** |
 | model / graph / kv_cache / tokenizer / common | 见 v0.2 文档 | 不变 |

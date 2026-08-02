@@ -16,12 +16,12 @@ v0.2 的三条主线：
 | 文件 | 职责 | v0.2 变化 |
 | --- | --- | --- |
 | model.h / model.cpp | 模型数据结构 + 从 GGUF 加载权重 | 基本不变 |
-| **[tokenizer.h](../src/tokenizer.h) / [tokenizer.cpp](../src/tokenizer.cpp)** | 自研 Qwen3 分词器（byte-level BPE） | **新增** |
-| **[kv_cache.h](../src/kv_cache.h) / [kv_cache.cpp](../src/kv_cache.cpp)** | 增量 KV cache（每层 K/V 持久化） | **新增** |
-| **[common.h](../src/common.h) / [common.cpp](../src/common.cpp)** | 计时器 / chat 模板 / 字节格式化 | **新增** |
-| [graph.h](../src/graph.h) / [graph.cpp](../src/graph.cpp) | 构建单步前向计算图 | **改：接 KV cache** |
+| **[tokenizer.h](../src/core/tokenizer.h) / [tokenizer.cpp](../src/core/tokenizer.cpp)** | 自研 Qwen3 分词器（byte-level BPE） | **新增** |
+| **[kv_cache.h](../src/llm/kv_cache.h) / [kv_cache.cpp](../src/llm/kv_cache.cpp)** | 增量 KV cache（每层 K/V 持久化） | **新增** |
+| **[common.h](../src/core/common.h) / [common.cpp](../src/core/common.cpp)** | 计时器 / chat 模板 / 字节格式化 | **新增** |
+| [graph.h](../src/llm/graph.h) / [graph.cpp](../src/llm/graph.cpp) | 构建单步前向计算图 | **改：接 KV cache** |
 | [main.cpp](../src/main.cpp) | 主链路 | **改：prefill/decode + 流式打印** |
-| [log.h](../src/log.h) | 头文件内实现的轻量流式日志 | 不变 |
+| [log.h](../src/core/log.h) | 头文件内实现的轻量流式日志 | 不变 |
 
 ---
 

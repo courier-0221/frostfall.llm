@@ -7,10 +7,10 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| [model.h](../src/model.h) / [model.cpp](../src/model.cpp) | 模型数据结构 + 从 GGUF 加载权重 |
-| [graph.h](../src/graph.h) / [graph.cpp](../src/graph.cpp) | 构建 Qwen3 单步前向的 ggml 计算图 |
+| [model.h](../src/core/model.h) / [model.cpp](../src/core/model.cpp) | 模型数据结构 + 从 GGUF 加载权重 |
+| [graph.h](../src/llm/graph.h) / [graph.cpp](../src/llm/graph.cpp) | 构建 Qwen3 单步前向的 ggml 计算图 |
 | [main.cpp](../src/main.cpp) | 主链路：加载 → 构图 → 前向 → 贪心解码 → 循环 |
-| [log.h](../src/log.h) | 头文件内实现的轻量流式日志（glog 兼容） |
+| [log.h](../src/core/log.h) | 头文件内实现的轻量流式日志（glog 兼容） |
 
 ---
 

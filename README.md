@@ -1,12 +1,24 @@
 # frostfall.llm
 
-> 基于 **ggml v0.15.3** 的极简教学版大模型推理框架，唯一目标模型：**Qwen3-0.6B**。
+> 基于 **ggml v0.15.3** 的极简教学版大模型推理框架，目标模型：**Qwen3-0.6B**（生成）与
+> **Qwen3-Embedding-0.6B**（文本向量）。
 >
-> 设计目标：用尽量少、尽量清晰的 C++ 代码，把"加载模型 → 分词 → 构图 → 前向 → 增量解码"的完整链路跑通。
+> 设计目标：用尽量少、尽量清晰的 C++ 代码，把"加载模型 → 分词 → 构图 → 前向"的完整链路跑通
+> （LLM 侧到增量解码为止，embed 侧到 pooling 出向量为止）。
 
 ---
 
-## 当前版本：v1.0
+## 当前版本
+
+仓库承载两条产品线，共享 `src/core` 基础设施（GGUF 加载 / 分词），统一构建为单一共享库
+`libfrostfall.so`：
+
+| 产品线 | 当前版本 | 形态 |
+| --- | --- | --- |
+| **frostfall.llm** | v1.0 | 库 API（`InferenceEngine`）+ 4 个调用示例（`examples/llm/api_test`） |
+| **frostfall.embed** | v0.1 | smoke CLI（`examples/embed/v0_1_smoke`）；v1.0 将收口为 `EmbeddingEngine` 库 API |
+
+### frostfall.llm v1.0
 
 v1.0 在 v0.3（自研分词 + 增量 KV cache + 采样策略）的基础上，把"命令行 demo"升级为
 **可被业务集成的通用推理接口**：命令行程序 `frostfall` 已下线，仓库产出改为共享库
@@ -23,6 +35,14 @@ v1.0 在 v0.3（自研分词 + 增量 KV cache + 采样策略）的基础上，�
 v0.1~v0.3 的自研 Tokenizer、增量 KV cache、采样策略（temperature / top-k / top-p / 重复惩罚 / seed）
 均在库内部保留，只是不再通过命令行参数暴露，而是通过 `EngineConfig.sampling`（引擎级固定配置）传入。
 
+### frostfall.embed v0.1
+
+以 llm v1.0 的 `src/` 树为基线，把"生成 logits + 采样自回归"替换为
+"取最后隐层 + last-token pool + MRL 截断 + L2 归一化"，打通 Qwen3-Embedding-0.6B
+文本向量化的最小链路（smoke CLI）。embed 专属模块（`embed_graph` / `pooling` /
+`qwen3_embed_prompt`）与 llm 模块同处一个 `libfrostfall.so`，`src/` 按
+`core / llm / embed` 划分模块目录。详细设计见 `doc/embed/design_embed.md`。
+
 
 ---
 
@@ -31,31 +51,37 @@ v0.1~v0.3 的自研 Tokenizer、增量 KV cache、采样策略（temperature / t
 ```
 frostfall.llm/
 ├── src/
-│   ├── inference_engine.{h,cpp}  # 引擎门面：Init / Infer / Cancel / GetLastStats
-│   ├── llm_types.h               # 协议类型：Role/Message/ToolCall/LlmRequest/LlmResponse/SamplingParams
-│   ├── qwen3_chat.{h,cpp}        # Qwen3 ChatML 编解码：PromptBuilder + ThinkSplitter + ToolCallSplitter
-│   ├── model.{h,cpp}             # GGUF 加载，qwen3_model 权重结构体
-│   ├── graph.{h,cpp}             # qwen3_build_graph()，搭出 Qwen3 前向计算图
-│   ├── kv_cache.{h,cpp}          # 增量 KV cache
-│   ├── tokenizer.{h,cpp}         # 自研 byte-level BPE 分词器（从 GGUF 元数据构建）
-│   ├── sampler.{h,cpp}           # 采样策略（greedy / temperature / top-k / top-p / 重复惩罚）
-│   ├── common.{h,cpp}            # 计时器、字节数格式化等工具
-│   └── log.h                     # 日志宏
-├── examples/llm/api_test/          # 链接 frostfall 库的端到端调用示例（同时也是 CMake target）
-│   ├── infer_nothink_blocking.cpp  # 非流式 + 关闭思考：单轮/工具调用/多轮
-│   ├── infer_nothink_stream.cpp    # 流式 + 关闭思考：单轮/工具调用/多轮
-│   ├── infer_yesthink_blocking.cpp # 非流式 + 开启思考
-│   ├── infer_yesthink_stream.cpp   # 流式 + 开启思考
-│   ├── infer_test_util.h           # 公共工具：打印/统计/CLI 解析/runner
-│   └── llm_infer_conf.json         # 示例 EngineConfig
+│   ├── core/                        # 任务无关基础设施（llm / embed 共用）
+│   │   ├── model.{h,cpp}            # GGUF 加载，qwen3_model 权重结构体
+│   │   ├── tokenizer.{h,cpp}        # 自研 byte-level BPE 分词器（从 GGUF 元数据构建）
+│   │   ├── common.{h,cpp}           # 计时器、字节数格式化等工具
+│   │   └── log.h                    # 日志宏
+│   ├── llm/                         # 生成式推理专用（自回归 decode）
+│   │   ├── inference_engine.{h,cpp} # 引擎门面：Init / Infer / Cancel / GetLastStats
+│   │   ├── llm_types.h              # 协议类型：Role/Message/ToolCall/LlmRequest/LlmResponse/SamplingParams
+│   │   ├── qwen3_chat.{h,cpp}       # Qwen3 ChatML 编解码：PromptBuilder + ThinkSplitter + ToolCallSplitter
+│   │   ├── graph.{h,cpp}            # qwen3_build_graph()：带增量 KV cache 的前向图
+│   │   ├── kv_cache.{h,cpp}         # 增量 KV cache
+│   │   └── sampler.{h,cpp}          # 采样策略（greedy / temperature / top-k / top-p / 重复惩罚）
+│   └── embed/                       # 文本向量推理专用（单次前向）
+│       ├── embed_graph.{h,cpp}      # qwen3_embed_build_graph()：无 KV cache、输出最后隐层（不过 lm_head）
+│       ├── pooling.{h,cpp}          # last-token pool + MRL 截断 + L2 归一化
+│       └── qwen3_embed_prompt.{h,cpp} # query 侧 "Instruct:\nQuery:" 前缀模板
+├── examples/
+│   ├── llm/api_test/                # LLM 端到端调用示例（4 个可执行文件，链接 frostfall 库）
+│   │   ├── infer_nothink_blocking.cpp  # 非流式 + 关闭思考：单轮/工具调用/多轮
+│   │   ├── infer_nothink_stream.cpp    # 流式 + 关闭思考：单轮/工具调用/多轮
+│   │   ├── infer_yesthink_blocking.cpp # 非流式 + 开启思考
+│   │   ├── infer_yesthink_stream.cpp   # 流式 + 开启思考
+│   │   ├── infer_test_util.h           # 公共工具：打印/统计/CLI 解析/runner
+│   │   └── llm_infer_conf.json         # 示例 EngineConfig（构建时拷贝到产物目录）
+│   └── embed/v0_1_smoke/            # embed v0.1 最小 smoke CLI（薄壳，链接 frostfall 库）
 ├── tools/                # HF -> GGUF 转换脚本
 ├── third_party/ggml/     # ggml v0.15.3（内置源码，随仓库跟踪）
-├── doc/llm/design_llm.md         # 基础推理链路设计文档（v0.1~v0.3）
-├── doc/llm/design_llm_v1.0.md    # 通用推理接口设计文档（v1.0，InferenceEngine）
-├── doc/llm/code_analysis_llm-v0.1.md  # v0.1 逐接口代码走读
-├── doc/llm/code_analysis_llm-v0.2.md  # v0.2 逐接口代码走读
-├── doc/llm/code_analysis_llm-v0.3.md  # v0.3 采样策略逐接口走读
-└── CMakeLists.txt
+├── doc/llm/              # frostfall.llm 设计文档 + 逐版本代码走读
+├── doc/embed/            # frostfall.embed 设计文档 + 转换笔记 + 代码走读
+├── doc/qwen_model/       # Qwen3 / Qwen3-Embedding 模型架构资料
+└── CMakeLists.txt        # 单一共享库 libfrostfall.so（core + llm + embed 模块源文件）
 ```
 
 ---
@@ -88,8 +114,9 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
 # 产物
-./build/libfrostfall.so                             # 共享库
-./build/examples/llm/api_test/infer_nothink_blocking    # 调用示例可执行文件（共 4 个）
+./build/libfrostfall.so                                # 共享库（core + llm + embed 全部模块）
+./build/examples/llm/api_test/infer_nothink_blocking   # LLM 调用示例可执行文件（共 4 个）
+./build/examples/embed/v0_1_smoke/v0_1_smoke           # embed smoke CLI
 ```
 
 ---
@@ -106,9 +133,19 @@ python tools/convert_hf_to_gguf.py \
     --outtype f16
 ```
 
+Qwen3-Embedding-0.6B 用同一脚本转换（架构同为 `Qwen3ForCausalLM`，详见
+`doc/embed/convert_hf_to_gguf_qwen3-0.6b_embed.md`）：
+
+```bash
+python tools/convert_hf_to_gguf.py \
+    /path/to/Qwen3-Embedding-0.6B \
+    --outfile models/qwen3-embedding-0.6b-f16.gguf \
+    --outtype f16
+```
+
 ---
 
-## 使用（库 API）
+## 使用（库 API · frostfall.llm）
 
 对外头文件只需要 `#include "inference_engine.h"` 和 `#include "llm_types.h"`，
 链接 `frostfall` 库即可。全部公共符号位于 `namespace Frostfall`。
@@ -235,6 +272,22 @@ InferenceStats s = engine.GetLastStats();  // prompt/gen 吞吐、TTFT 等（调
 
 ---
 
+## 运行 embed smoke 示例（examples/embed/v0_1_smoke）
+
+stdout 只打一行 JSON（`dim` / `n_tokens` / `norm` / 前 8 维），供对拍脚本 grep；日志走 stderr：
+
+```bash
+# document 侧：原文直接编码
+./build/examples/embed/v0_1_smoke/v0_1_smoke models/qwen3-embedding-0.6b-f16.gguf \
+    --text "The capital of China is Beijing."
+
+# query 侧：自动拼 "Instruct: {task}\nQuery:" 前缀；MRL 截断到 256 维；导出全量向量供对拍
+./build/examples/embed/v0_1_smoke/v0_1_smoke models/qwen3-embedding-0.6b-f16.gguf \
+    --text "How do I bake bread?" --is-query --target-dim 256 --out emb.json
+```
+
+---
+
 ## API 参考（核心类型速查）
 
 ### `EngineConfig`
@@ -289,3 +342,5 @@ InferenceStats s = engine.GetLastStats();  // prompt/gen 吞吐、TTFT 等（调
 | v0.3 | 采样策略：temperature / top-k / top-p / 重复惩罚 / 可复现 seed | ✅ 已完成 |
 | v0.4 | 量化权重（Q4_K/Q8_0）、CUDA backend | 规划中 |
 | **v1.0** | 通用推理接口：`InferenceEngine` + thinking/tool-call 分离 + 无状态多轮 | ✅ 当前版本 |
+| **embed v0.1** | 文本向量最小链路：单次前向 + last-token pool + MRL + L2（smoke CLI） | ✅ 当前版本 |
+| embed v1.0 | `EmbeddingEngine` 库 API + 静态 batch（左 padding + attention mask） | 规划中 |
