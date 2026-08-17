@@ -33,6 +33,7 @@ set(FROSTFALL_EMBED_SOURCES
     src/embed/embed_graph.cpp
     src/embed/pooling.cpp
     src/embed/qwen3_embed_prompt.cpp
+    src/embed/embedding_engine.cpp
 )
 
 # 单一共享库：目录划分只是物理组织，产物仍是一个 libfrostfall.so。
@@ -49,6 +50,5 @@ target_link_libraries(frostfall PUBLIC ggml Threads::Threads)
 # ---- 调用示例：链接 frostfall 库的端到端示例程序 ----
 option(FROSTFALL_BUILD_EXAMPLES "Build frostfall example executables" ON)
 if (FROSTFALL_BUILD_EXAMPLES)
-    add_subdirectory(examples/llm/api_test)
-    add_subdirectory(examples/embed/v0_1_smoke)
+    add_subdirectory(examples/embed/v1_0_api)
 endif()

@@ -16,7 +16,7 @@
 | 产品线 | 当前版本 | 形态 |
 | --- | --- | --- |
 | **frostfall.llm** | v1.0 | 库 API（`InferenceEngine`）+ 4 个调用示例（`examples/llm/api_test`） |
-| **frostfall.embed** | v0.1 | smoke CLI（`examples/embed/v0_1_smoke`）；v1.0 将收口为 `EmbeddingEngine` 库 API |
+| **frostfall.embed** | v1.0 | 库 API（`EmbeddingEngine`）+ v1.0 调用示例（`examples/embed/v1_0_api`） |
 
 ### frostfall.llm v1.0
 
@@ -35,13 +35,13 @@ v1.0 在 v0.3（自研分词 + 增量 KV cache + 采样策略）的基础上，�
 v0.1~v0.3 的自研 Tokenizer、增量 KV cache、采样策略（temperature / top-k / top-p / 重复惩罚 / seed）
 均在库内部保留，只是不再通过命令行参数暴露，而是通过 `EngineConfig.sampling`（引擎级固定配置）传入。
 
-### frostfall.embed v0.1
+### frostfall.embed v1.0
 
 以 llm v1.0 的 `src/` 树为基线，把"生成 logits + 采样自回归"替换为
-"取最后隐层 + last-token pool + MRL 截断 + L2 归一化"，打通 Qwen3-Embedding-0.6B
-文本向量化的最小链路（smoke CLI）。embed 专属模块（`embed_graph` / `pooling` /
-`qwen3_embed_prompt`）与 llm 模块同处一个 `libfrostfall.so`，`src/` 按
-`core / llm / embed` 划分模块目录。详细设计见 `doc/embed/design_embed.md`。
+"取最后隐层 + last-token pool + MRL 截断 + L2 归一化"，并收口为可集成的
+`Frostfall::EmbeddingEngine` 库 API。embed 专属模块（`embed_graph` / `pooling` /
+`qwen3_embed_prompt` / `embedding_engine`）与 llm 模块同处一个 `libfrostfall.so`，
+当前分支只维护 v1.0 编译与示例；v0.1 历史实现请切换到对应分支查看。
 
 
 ---
@@ -66,7 +66,9 @@ frostfall.llm/
 │   └── embed/                       # 文本向量推理专用（单次前向）
 │       ├── embed_graph.{h,cpp}      # qwen3_embed_build_graph()：无 KV cache、输出最后隐层（不过 lm_head）
 │       ├── pooling.{h,cpp}          # last-token pool + MRL 截断 + L2 归一化
-│       └── qwen3_embed_prompt.{h,cpp} # query 侧 "Instruct:\nQuery:" 前缀模板
+│       ├── qwen3_embed_prompt.{h,cpp} # query 侧 "Instruct:\nQuery:" 前缀模板
+│       ├── embed_types.h              # embedding 请求 / 响应 / 统计结构
+│       └── embedding_engine.{h,cpp}    # EmbeddingEngine：库化 API + 静态 batch
 ├── examples/
 │   ├── llm/api_test/                # LLM 端到端调用示例（4 个可执行文件，链接 frostfall 库）
 │   │   ├── infer_nothink_blocking.cpp  # 非流式 + 关闭思考：单轮/工具调用/多轮
@@ -75,7 +77,7 @@ frostfall.llm/
 │   │   ├── infer_yesthink_stream.cpp   # 流式 + 开启思考
 │   │   ├── infer_test_util.h           # 公共工具：打印/统计/CLI 解析/runner
 │   │   └── llm_infer_conf.json         # 示例 EngineConfig（构建时拷贝到产物目录）
-│   └── embed/v0_1_smoke/            # embed v0.1 最小 smoke CLI（薄壳，链接 frostfall 库）
+│   └── embed/v1_0_api/                  # embed v1.0 调用示例（blocking + batch）
 ├── tools/                # HF -> GGUF 转换脚本
 ├── third_party/ggml/     # ggml v0.15.3（内置源码，随仓库跟踪）
 ├── doc/llm/              # frostfall.llm 设计文档 + 逐版本代码走读
@@ -116,7 +118,8 @@ cmake --build build -j$(nproc)
 # 产物
 ./build/libfrostfall.so                                # 共享库（core + llm + embed 全部模块）
 ./build/examples/llm/api_test/infer_nothink_blocking   # LLM 调用示例可执行文件（共 4 个）
-./build/examples/embed/v0_1_smoke/v0_1_smoke           # embed smoke CLI
+./build/examples/embed/v1_0_api/embed_blocking             # embed 单条调用示例
+./build/examples/embed/v1_0_api/embed_batch                # embed batch 调用示例
 ```
 
 ---
@@ -272,18 +275,21 @@ InferenceStats s = engine.GetLastStats();  // prompt/gen 吞吐、TTFT 等（调
 
 ---
 
-## 运行 embed smoke 示例（examples/embed/v0_1_smoke）
+## 运行 embed v1.0 示例（examples/embed/v1_0_api）
 
-stdout 只打一行 JSON（`dim` / `n_tokens` / `norm` / 前 8 维），供对拍脚本 grep；日志走 stderr：
+示例统一读取 `EmbeddingEngine` JSON 配置，覆盖单条 query/document、MRL 截断和 batch 相似度矩阵：
 
 ```bash
-# document 侧：原文直接编码
-./build/examples/embed/v0_1_smoke/v0_1_smoke models/qwen3-embedding-0.6b-f16.gguf \
-    --text "The capital of China is Beijing."
+# 单条 document 侧：原文直接编码，MRL 截断到 256 维
+./build/examples/embed/v1_0_api/embed_blocking examples/embed/v1_0_api/embed_conf.json \
+    --text "The capital of China is Beijing." --target-dim 256
 
-# query 侧：自动拼 "Instruct: {task}\nQuery:" 前缀；MRL 截断到 256 维；导出全量向量供对拍
-./build/examples/embed/v0_1_smoke/v0_1_smoke models/qwen3-embedding-0.6b-f16.gguf \
-    --text "How do I bake bread?" --is-query --target-dim 256 --out emb.json
+# 单条 query 侧：自动拼 "Instruct: {task}\nQuery:" 前缀
+./build/examples/embed/v1_0_api/embed_blocking examples/embed/v1_0_api/embed_conf.json \
+    --text "How do I bake bread?" --is-query --target-dim 256
+
+# batch 示例：2 query + 2 document，输出相似度矩阵
+./build/examples/embed/v1_0_api/embed_batch examples/embed/v1_0_api/embed_conf.json --target-dim 256
 ```
 
 ---
@@ -342,5 +348,4 @@ stdout 只打一行 JSON（`dim` / `n_tokens` / `norm` / 前 8 维），供对�
 | v0.3 | 采样策略：temperature / top-k / top-p / 重复惩罚 / 可复现 seed | ✅ 已完成 |
 | v0.4 | 量化权重（Q4_K/Q8_0）、CUDA backend | 规划中 |
 | **v1.0** | 通用推理接口：`InferenceEngine` + thinking/tool-call 分离 + 无状态多轮 | ✅ 当前版本 |
-| **embed v0.1** | 文本向量最小链路：单次前向 + last-token pool + MRL + L2（smoke CLI） | ✅ 当前版本 |
-| embed v1.0 | `EmbeddingEngine` 库 API + 静态 batch（左 padding + attention mask） | 规划中 |
+| **embed v1.0** | `EmbeddingEngine` 库 API + 静态 batch（左 padding + attention mask） | ✅ 当前版本 |
