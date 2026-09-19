@@ -32,5 +32,5 @@ target_link_libraries(frostfall PUBLIC ggml Threads::Threads)
 # ---- 调用示例：链接 frostfall 库的端到端示例程序 ----
 option(FROSTFALL_BUILD_EXAMPLES "Build frostfall example executables" ON)
 if (FROSTFALL_BUILD_EXAMPLES)
-    add_subdirectory(examples/llm/api_test)
+    add_subdirectory(examples/asr/api_test)
 endif()

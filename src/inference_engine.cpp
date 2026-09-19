@@ -117,7 +117,13 @@ struct InferenceEngine::Impl {
         };
         struct ggml_context* ctx = ggml_init(gparams);
 
-        struct ggml_cgraph* gf = qwen3_build_graph(ctx, model, kv, n, n_past, kMaxNodes);
+        qwen3_graph_params gp;
+        gp.n_tokens  = n;
+        gp.n_past    = n_past;
+        gp.max_nodes = kMaxNodes;
+        // 默认 logits_last_only=true：仅对最后位置执行 LM Head；引擎只读最后位置 logits，
+        // 行为不变且避免 prefill 产出 [n_vocab, n] 的巨大输出张量（asr/v0.1 同步优化）。
+        struct ggml_cgraph* gf = qwen3_build_graph(ctx, model, kv, gp);
         ggml_gallocr_alloc_graph(allocr, gf);
 
         struct ggml_tensor* t_tokens = ggml_graph_get_tensor(gf, QWEN3_TENSOR_NAME_TOKENS);
@@ -142,8 +148,8 @@ struct InferenceEngine::Impl {
 
         struct ggml_tensor* t_logits = ggml_graph_get_tensor(gf, QWEN3_TENSOR_NAME_LOGITS);
         std::vector<float> logits(n_vocab);
-        ggml_backend_tensor_get(t_logits, logits.data(),
-                (size_t)(n - 1) * n_vocab * sizeof(float), n_vocab * sizeof(float));
+        // logits_last_only 模式下 logits 恒为 [n_vocab, 1]，从 offset 0 读最后位置的值
+        ggml_backend_tensor_get(t_logits, logits.data(), 0, n_vocab * sizeof(float));
 
         ggml_free(ctx);
         kv.n_past = n_kv;

@@ -1,18 +1,19 @@
 #include "graph.h"
 
 #include <cmath>
+#include <string>
 
 // 单层前向的伪代码见 doc/design.md §2.3；GQA/RoPE/QK-Norm/因果 mask 的张量摆放细节见 §6。
 // v0.2 相比 v0.1 的核心改动：K/V 不再每层重算整段，而是把本次 n_tokens 个 token 的 K/V
 // 写入 kv cache 的 [n_past, n_past+n_tokens)，注意力从 cache 读取 [0, n_kv) 的全部历史。
 struct ggml_cgraph * qwen3_build_graph(
-        struct ggml_context * ctx,
-        const qwen3_model    & model,
-        const qwen3_kv_cache & kv,
-        int32_t                n_tokens,
-        int32_t                n_past,
-        int                    max_nodes) {
+        struct ggml_context       * ctx,
+        const qwen3_model         & model,
+        const qwen3_kv_cache      & kv,
+        const qwen3_graph_params  & params) {
     const qwen3_hparams & hp = model.hparams;
+    const int32_t n_tokens = params.n_tokens;
+    const int32_t n_past   = params.n_past;
 
     const int64_t n_embd        = hp.n_embd;
     const int64_t n_head        = hp.n_head;
@@ -21,12 +22,21 @@ struct ggml_cgraph * qwen3_build_graph(
     const int64_t n_embd_kv_all = hp.n_embd_kv_all(); // head_dim * n_head_kv
     const int64_t n_kv          = n_past + n_tokens;  // 本次注意力可见的历史长度
 
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, max_nodes, false);
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, params.max_nodes, false);
 
     // ---- 输入张量 ----
-    struct ggml_tensor * tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
-    ggml_set_name(tokens, QWEN3_TENSOR_NAME_TOKENS);
-    ggml_set_input(tokens);
+    // token id 入口（embd == nullptr 时使用）
+    struct ggml_tensor * tokens = nullptr;
+    if (!params.embd) {
+        tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_name(tokens, QWEN3_TENSOR_NAME_TOKENS);
+        ggml_set_input(tokens);
+    }
+
+    // 外部融合 Embedding 入口（asr/v0.1）：调用方在 ctx 中创建 [n_embd, n_tokens] F32
+    // 输入张量并经 params.embd 传入（已 set_input），直接作为第 0 层输入；
+    // 音频位置已在 Python/上层完成替换，Decoder 侧不感知差异。
+    struct ggml_tensor * embd_in = params.embd;
 
     struct ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
     ggml_set_name(positions, QWEN3_TENSOR_NAME_POS);
@@ -37,8 +47,9 @@ struct ggml_cgraph * qwen3_build_graph(
     ggml_set_name(kq_mask, QWEN3_TENSOR_NAME_MASK);
     ggml_set_input(kq_mask);
 
-    // token embedding：[n_embd, n_tokens]
-    struct ggml_tensor * x = ggml_get_rows(ctx, model.tok_embd, tokens);
+    // 第 0 层输入：token 查表或外部 Embedding
+    struct ggml_tensor * x = params.embd ? embd_in
+                                         : ggml_get_rows(ctx, model.tok_embd, tokens);
 
     const float kq_scale = 1.0f / sqrtf((float) n_embd_head);
     const size_t kv_esz  = ggml_element_size(kv.k[0]); // cache 元素字节数（F16 = 2）
@@ -134,14 +145,34 @@ struct ggml_cgraph * qwen3_build_graph(
         cur  = ggml_mul(ctx, gate, up);
         cur  = ggml_mul_mat(ctx, layer.ffn_down, cur); // [n_embd, n_tokens]
 
+        // FFN（SwiGLU）结束，残差输出
         x = ggml_add(ctx, inp_ffn, cur);
+
+        // 逐层输出导出（asr/v0.1 对齐工具用）：作为图输出节点保留
+        if (params.want_layer_outputs) {
+            struct ggml_tensor * layer_out = ggml_cont(ctx, x);
+            const std::string lname = std::string(QWEN3_TENSOR_NAME_LAYER_OUT_PREFIX) + std::to_string(il);
+            ggml_set_name(layer_out, lname.c_str());
+            ggml_set_output(layer_out);
+            ggml_build_forward_expand(gf, layer_out);
+        }
     }
 
     // ==================== 末端 RMSNorm + lm_head ====================
     x = ggml_rms_norm(ctx, x, hp.rms_norm_eps);
     x = ggml_mul(ctx, x, model.output_norm);
 
-    struct ggml_tensor * logits = ggml_mul_mat(ctx, model.output, x); // [n_vocab, n_tokens]
+    struct ggml_tensor * logits;
+    if (params.logits_last_only) {
+        // 仅对最后位置执行 LM Head（asr/v0.1）：view 残差流的最后一列再投影，
+        // logits 从 [n_vocab, n_tokens] 缩减为 [n_vocab, 1]。生成侧只读最后位置，
+        // 行为不变；prefill 时避免 [151936, S] 的巨大输出张量。
+        struct ggml_tensor * x_last = ggml_view_1d(ctx, x, hp.n_embd,
+                (int64_t)(n_tokens - 1) * hp.n_embd * ggml_element_size(x));
+        logits = ggml_mul_mat(ctx, model.output, x_last); // [n_vocab, 1]
+    } else {
+        logits = ggml_mul_mat(ctx, model.output, x);      // [n_vocab, n_tokens]
+    }
     ggml_set_name(logits, QWEN3_TENSOR_NAME_LOGITS);
     ggml_set_output(logits);
 
