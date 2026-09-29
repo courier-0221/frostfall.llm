@@ -1,543 +1,309 @@
-# asr/v0.1 —— 代码逐接口详解
+# asr/v0.1 代码分析：沿一条音频追踪数据与调用
 
-> 本文按"**转换入口 → GGUF 契约 → 加载 → 构图 → 参考基线 → 对齐工具**"的顺序，逐个接口拆解 asr/v0.1 源码。
-> 版本目标、验收标准与实施记录见 [design_asr_v0.x.md](design_asr_v0.x.md)；ASR 模型本身的架构背景见
-> [Qwen3-ASR-0.6B_Model_Architecture_And_Configs.md](../qwen_model/Qwen3-ASR-0.6B_Model_Architecture_And_Configs.md)。
-> 本文只讲"代码里每个接口做了什么、为什么这么写、有哪些坑"。
+本文解释当前代码如何从“模型 + 音频”走到 C++ 生成与数值对比，不再按每个结构体、宏和辅助函数逐项罗列。
 
-源码文件：
+- 想先跑起来：看 [README 的 ASR 使用步骤](../../README.md)。
+- 想理解模型结构：看 [模型架构与推理流程](../qwen_model/Qwen3-ASR-0.6B_Model_Architecture_And_Inference.md)。
+- 想了解交付范围与验收历史：看 [版本规划](design_asr.md)。
 
-| 文件 | 职责 |
-| --- | --- |
-| [tools/convert_asr_hf_to_gguf.py](../../tools/convert_asr_hf_to_gguf.py) | HF 权重包 → 单文件 GGUF（独立脚本，不改动 LLM 转换） |
-| [src/model.h](../../src/model.h) / [model.cpp](../../src/model.cpp) | `qwen3-asr` 架构识别 + 音频塔张量加载与形状校验 |
-| [src/graph.h](../../src/graph.h) / [graph.cpp](../../src/graph.cpp) | Decoder 双入口（tokens / 外部 Embedding）+ 仅末位 LM Head + 逐层导出 |
-| [tools/export_asr_reference.py](../../tools/export_asr_reference.py) | Python fp32 参考基线导出（音频塔复现 + Decoder 基线） |
-| [examples/asr/api_test/asr_align_v01.cpp](../../examples/asr/api_test/asr_align_v01.cpp) | 数值对齐工具（读 GGUF + 参考数据，输出误差报告） |
+## 0. 整体数据流与源码阅读顺序
 
----
-
-## 0. 整体数据流
+v0.1 验证的是：**给定相同的融合 Embedding，C++ Decoder 能否复现 Python 参考的计算和生成结果。**音频前处理、音频 Encoder 和特征融合在 Python 中执行；C++ 从 Decoder 输入开始独立计算。
 
 ```mermaid
-flowchart LR
-    A[HF 权重包<br/>612 张量] -->|convert_asr_hf_to_gguf.py| B[models/qwen3-asr-0.6b-f16.gguf<br/>text=311 + audio=301]
-    B -->|qwen3_model_load| C[qwen3_model<br/>文本权重 + 音频塔张量全加载]
-    D[export_asr_reference.py] -->|embd/hidden/logits/ids npy| E[work/asr_ref/auto,lang]
-    C --> F[asr_align_v01]
-    E --> F
-    F -->|embd 入口 prefill<br/>tokens 入口 decode| G[误差报告<br/>hidden/logits/topk/生成]
+flowchart TB
+    Model["原始 ASR 权重 / 配置 / Tokenizer"] --> Convert["① 模型转换<br/>convert_asr_hf_to_gguf.py"]
+    Convert --> GGUF["GGUF：权重、超参、词表<br/>不同音频共用"]
+    Model --> Export["② 音频参考导出<br/>export_asr_reference.py"]
+    WAV["WAV 或合成信号"] --> Export
+    Export --> Embd["融合输入 embd.npy<br/>这条音频对应的 Decoder 输入"]
+    Model --> PyDec["Python fp32 Decoder"]
+    Embd --> PyDec
+    PyDec --> Ref["参考 hidden / logits / token"]
+    GGUF --> Load["③ C++ 初始化<br/>Harness::load"]
+    Load --> Eval["④ C++ 前向与生成<br/>Harness::eval → qwen3_build_graph"]
+    Embd --> Eval
+    Eval --> Check["⑤ 对齐比较<br/>prefill → teacher forcing → 自由生成"]
+    Ref --> Check
+    Check --> Result["误差统计 / 原始文字 / PASS 或 FAIL"]
 ```
 
-v0.1 的关键设计取舍：
+图中不是一个跨语言进程：两个 Python 脚本和 C++ 程序分别运行，通过 GGUF 和 `.npy` 文件交接。**换模型要重新准备 GGUF 和参考；仅换音频只需重新导出参考。**
 
-1. **音频塔只加载不计算**：301 个音频张量全部进内存并校验形状（`asr.audio.*`），但不进计算图；计算留给 v0.2。
-   音频特征由 Python 导出，C++ 通过外部 Embedding 入口消费——把"Decoder 数值正确性"和"音频计算"解耦。
-2. **双入口共享层计算**：`tokens`（查表）与 `embd`（外部 F32 矩阵）只影响第 0 层输入的产生方式，28 层计算完全复用。
-3. **仅末位 LM Head**：prefill 的 LM Head 从 `[n_vocab, S]` 缩为 `[n_vocab, 1]`。LLM 引擎只读末位 logits，行为不变；
-   ASR 的 teacher forcing 每步也是单 token decode，天然只看末位。
-4. **参考基线 fp32**：高于官方 bf16 推理精度，误差全部来自本工程的 F16 权重与 F16 KV cache，便于归因。
+| 阅读顺序 | 源码入口 | 输入 → 输出 | 本文位置 |
+| --- | --- | --- | --- |
+| ① 准备权重 | [转换脚本 main](../../tools/convert_asr_hf_to_gguf.py#L241-L419) | 原始权重 → GGUF、映射清单 | §1 |
+| ② 准备输入和对照结果 | [export_case](../../tools/export_asr_reference.py#L223-L357) | PCM + 原始权重 → 融合 Embedding、参考数组 | §2 |
+| ③ 进入 C++ | [对齐工具 main](../../examples/asr/api_test/asr_align_v01.cpp#L281-L323) | GGUF + 5 个 npy → 模型、参考数组和 KV | §3.1 |
+| ④ 一次前向 | [Harness::eval](../../examples/asr/api_test/asr_align_v01.cpp#L214-L267)、[构图入口](../../src/graph.cpp#L9-L52) | Embedding 或 token IDs → 更新 KV、输出 logits | §3.2 |
+| ⑤ 验证和生成 | [三段验证](../../examples/asr/api_test/asr_align_v01.cpp#L327-L471) | C++ 结果 + Python 参考 → 比较结论 | §3.3～§4 |
 
-### 端到端执行步骤（从零跑通）
+贯穿下文的记号：T 是有效 Mel 帧数，A 是音频向量数，S 是混合输入的位置数，G 是参考输出 token 数，V 是词表大小 151936。形状默认为 NumPy/PyTorch 顺序；ggml 的 `ne` 顺序另行注明。
 
-以下命令全部在工程根目录执行；`$MODEL_DIR` 为原始权重包（ModelScope snapshot）：
+## 1. 准备模型：哪些数据写入 GGUF，C++ 如何拿到权重
 
-```bash
-MODEL_DIR=~/.cache/modelscope/models/Qwen--Qwen3-ASR-0.6B/snapshots/master
-```
+### 1.1 转换脚本只处理模型，不处理音频
 
-**环境前提**：conda `llm` 环境（实测 Python 3.12.13、torch 2.12.1+cu130 —— 参考基线以 CPU 张量跑、transformers 4.57.6、numpy、safetensors）。
-gguf 库使用工程内置的 `tools/gguf-py`（转换脚本自行 `sys.path.insert`），无需额外安装；C++ 侧仅依赖 CMake + ggml（third_party 内置）。
-
-#### 步骤 1：转换 GGUF
-
-```bash
-conda run -n llm python tools/convert_asr_hf_to_gguf.py $MODEL_DIR \
-    --outfile models/qwen3-asr-0.6b-f16.gguf \
-    --mapping-out doc/asr/asr_v01_tensor_mapping.json
-```
-
-预期关键输出（张量数不符会直接报错退出，不产出残缺文件）：
+[convert_asr_hf_to_gguf.py](../../tools/convert_asr_hf_to_gguf.py) 的主线是：
 
 ```text
-  612 tensors
-mapping OK: 612 tensors (text=311, audio=301)
-tokenizer: 151936 tokens, 151387 merges, 231 dummy, eos=151645, pad=151645
-done: models/qwen3-asr-0.6b-f16.gguf (1795.3 MB)
-tensor mapping report -> doc/asr/asr_v01_tensor_mapping.json
+读取 config.json 与 model.safetensors
+ → map_tensor_name：原始名字映射为 GGUF 名字
+ → convert_data：矩阵 F16，norm/bias F32
+ → 检查未知名字、重复映射、缺失张量和总数 612
+ → build_tokenizer：整理词表、merges 和 Added Tokens
+ → 写入 GGUF 元数据与张量
+ → 输出张量映射清单
 ```
 
-#### 步骤 2：导出参考基线（Python，CPU fp32）
-
-```bash
-conda run -n llm python tools/export_asr_reference.py $MODEL_DIR --out-dir work/asr_ref
-```
-
-预期输出（auto/lang 两案例各一行，含 A(T) 公式断言校验）：
-
-```text
-[auto] T=500 A=65 S=80 n_gen=4 gen_preview='language None<asr_text><|im_end|>'
-[lang] T=500 A=65 S=83 n_gen=3 gen_preview='哦。'
-reference data exported to work/asr_ref
-```
-
-产物：`work/asr_ref/{auto,lang}/` 下各 11 个 npy + test.wav + meta.json（清单见 §4.5）。
-
-**可选：真人语音替代合成音频**（`--wav`，实测通过）：
-
-```bash
-conda run -n llm python tools/export_asr_reference.py $MODEL_DIR \
-    --wav /path/to/speech.wav --out-dir work/asr_ref_wav
-```
-
-wav 要求：mono/立体声均可（立体声取平均）、8/16/32-bit PCM（24-bit 或 mp3 需先转 16-bit）、
-采样率不限（非 16k 自动线性插值重采样到 16k，建议导出端直接选 16k）、时长 3~10 s 为宜。
-不指定 `--out-dir` 时自动切到 `work/asr_ref_wav`，合成基线不被覆盖；
-C++ 对齐只需把 `--ref-dir` 指过去（S/n_gen 全动态读取，工具零改动）。
-实测：48kHz 立体声 8s wav → T=800 A=104 S=119/122 → 对齐 PASS。
-
-#### 步骤 3：构建全工程
-
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
-```
-
-产物：`build/libfrostfall.so`、`build/examples/llm/api_test/infer_*`（4 个 LLM 示例）、
-`build/examples/asr/api_test/asr_align_v01`（对齐工具）。
-
-#### 步骤 4：运行数值对齐（验收主步骤）
-
-```bash
-./build/examples/asr/api_test/asr_align_v01 \
-    --gguf models/qwen3-asr-0.6b-f16.gguf --ref-dir work/asr_ref/auto
-./build/examples/asr/api_test/asr_align_v01 \
-    --gguf models/qwen3-asr-0.6b-f16.gguf --ref-dir work/asr_ref/lang
-```
-
-可选参数 `--max-gen N`（默认 32，自由生成上限并决定 KV 预留）。**退出码 0 = PASS，非 0 = FAIL**。
-预期输出（auto 案例，中间 28 行逐层误差略）：
-
-```text
-== asr/v0.1 alignment ==
-  S(prefill)=80 n_gen_ref=4
--- prefill (embd entry, layer outputs on) --
-  [layer_out_0] n=81920 max_abs=0.00121164 rmse=0.000133298 | ex-sink max_abs=0.00121164 rmse=0.000133532
-  ...（28 层逐层误差，均带 ex-sink 统计）...
-  [embd_input] n=81920 max_abs=0 rmse=0
-  [prefill_logits] n=151936 max_abs=0.055469 rmse=0.0155598 top10_hit=10/10
--- teacher forcing (3 steps) --
-  [decode_logits] steps=3 worst_max_abs=0.0322256 worst_top10_hit=10/10
--- free greedy generation --
-  [free_gen] n=4 (ref 4) prefix_match=4/4
-  [text] language None<asr_text><|im_end|>
-== result: PASS (failures=0) ==
-```
-
-正式误差报告归档在 [asr_v01_align_report_auto.log](asr_v01_align_report_auto.log) / [asr_v01_align_report_lang.log](asr_v01_align_report_lang.log)，重跑后可 diff 对比。
-
-#### 步骤 5：LLM 回归（确认共享代码未被破坏）
-
-```bash
-CONF=$PWD/build/examples/llm/api_test/llm_infer_conf.json
-for ex in infer_nothink_stream infer_nothink_blocking \
-          infer_yesthink_stream infer_yesthink_blocking; do
-    ./build/examples/llm/api_test/$ex --config $CONF
-done
-```
-
-预期：每个示例结尾打印 `Ran 3 tests (...)` 且退出码 0。
-
-> **运行目录坑**：`--config` 的值与 conf 内的 `model_path` 都按**当前工作目录**解析。
-> conf 被 configure_file 拷到 build 目录，但 `model_path: "models/..."` 是相对工程根写的，
-> 所以必须在工程根运行并给 conf **绝对路径**（如上）；若在 build 目录里运行，conf 用相对路径即可但模型路径会解析错。
-
-#### 步骤 6：转写文本怎么读（v0.1 特有）
-
-对齐工具打印的生成文本是模型对合成音频的真实响应，不是转写质量基线：
-auto 案例 `language None<asr_text>` 表示官方协议判断为无语音/未指定语言；lang 案例在 `language Chinese<asr_text>`
-前缀约束下生成 `哦。`。v0.1 的验收信号是 **PASS 与 token 一致性**，文本内容本身无关紧要（§5.5）。
-
----
-
-## 1. 转换入口（tools/convert_asr_hf_to_gguf.py）
-
-### 1.1 四张映射表
-
-| 表 | 条目数 | 说明 |
+| 原始模块 | GGUF 中的去向 | 当前用途 |
 | --- | --- | --- |
-| `TEXT_MAP` | 3 | 全局张量：`embed_tokens→token_embd`、`norm→output_norm`、`lm_head→output` |
-| `TEXT_LAYER_SUB` | 11 | 每文本层的子模块 → `blk.{i}.<sub>`，与 convert_hf_to_gguf.py 的 Qwen3 映射一致 |
-| `AUDIO_TOWER_MAP` | 13 | CNN/投影/ln_post → `asr.audio.*` 顶层命名空间 |
-| `AUDIO_LAYER_SUB` | 16 | 每音频层的子模块 → `asr.audio.blk.{i}.<sub>` |
+| `thinker.model.embed_tokens.weight` | `token_embd.weight` | C++ 单 token decode 的 Embedding 查表 |
+| `thinker.model.layers.*` | `blk.*`，28 层 | Decoder 主体计算 |
+| `thinker.model.norm.weight` | `output_norm.weight` | 最终 RMSNorm |
+| `thinker.lm_head.weight` | `output.weight` | hidden → 词表 logits |
+| `thinker.audio_tower.*` | `asr.audio.*`，301 个张量 | C++ 加载与形状校验，v0.1 不执行音频计算 |
 
-张量数校验闭环：3 + 28×11 = **311**（文本）、13 + 18×16 = **301**（音频），合计 **612**，与文档基线一致；
-`main()` 里映射后计数不符直接报错退出，不产出残缺 GGUF。
+文本侧为 `3 + 28×11 = 311` 个张量，音频侧为 `13 + 18×16 = 301` 个，总计 612。完整名字、dtype 和形状见 [映射清单](asr_v01_tensor_mapping.json)，无需在本文复制所有条目。
 
-### 1.2 conv 权重布局（为 v0.2 提前铺路）
+转换的几个约束决定后续能否正确计算：
+- **Embedding 与 LM Head 独立保存。**不能仅凭 `tie_word_embeddings` 配置删掉其中一份；Python 参考也以 `tie_word_embeddings=False` 分别加载。
+- **精度规则按完整名字匹配。**`is_f32_keep` 保留所有 `.bias`、以 `norm.weight` 结尾的权重，以及 `asr.audio.ln_post.weight`；其他权重转 F16 前检查数值范围。
+- **布局命名与内存重排不是一回事。**矩阵 PyTorch `[out,in]` 对应 ggml `ne=[in,out]`；卷积 `[out,in,KH,KW]` 对应 `ne=[KW,KH,in,out]`。当前转换保留连续数据顺序，后续卷积与展平仍需数值验证。
+- **词表与模型行数对齐。**ASR 的基础词表和 Added Tokens 写入 151936 个槽位，其余补 dummy；`special=true` 标为 CONTROL，非 special Added Token 标为 USER_DEFINED。
 
-PyTorch Conv2d 权重 `[out, in, KH, KW]` 是 contiguous 的，gguf-py 写入时把 shape 反转成 ggml `ne={KW, KH, in, out}`——
-这**恰好**是 `ggml_conv_2d`/im2col 期望的 filter 布局。所以转换脚本对 conv 权重不做任何物理重排，直接原样写入；
-`AUDIO_TOWER_MAP` 里每条 conv 映射都注明了这一点。v0.2 实现音频塔时无需再关心布局问题。
+GGUF 的 `general.architecture` 为 `qwen3-asr`，文本超参键使用 `qwen3-asr.*`；音频、前处理与协议分别在 `asr.audio.*`、`asr.mel.*`、`asr.*` 下。写入这些字段不代表本版已经计算所有对应模块。
 
-### 1.3 F32 保留规则（`is_f32_keep`）
+### 1.2 C++ 加载分为“建张量描述”和“搬运权重”
+
+[model.cpp](../../src/model.cpp#L92-L382) 中 `qwen3_model_load` 执行：
+
+1. `gguf_init_from_file(no_alloc=true)`：读取元数据，创建张量描述，尚未分配权重数据内存。
+2. 按架构前缀读取文本超参；按名字取得 `tok_embd`、`output_norm`、`output` 和各层指针。
+3. 进入 ASR 分支，读取音频参数和 EOS 集合；校验音频输出宽度等于文本宽度 1024，使用 `get_a` 校验音频张量形状。
+4. 从 `conv1.weight.ne[3]` 推导卷积通道数，并检查 `conv_out` 输入维度是否为通道数乘下采样后的频率宽度。
+5. 初始化 CPU backend，`ggml_backend_alloc_ctx_tensors` 分配权重内存，再由 `qwen3_load_tensor_data` 按 GGUF 偏移分块拷贝数据。
+
+输出是持有张量指针与 backend buffer 的 `qwen3_model`。**加载了音频权重不等于运行了音频网络**：是否计算由后续 graph 决定，当前 graph 只使用文本 Decoder 权重。
+
+## 2. Python 参考：音频如何变成 C++ 的输入与“答案”
+
+### 2.1 从 PCM 到融合 Embedding
+
+[导出脚本 main](../../tools/export_asr_reference.py#L360-L401) 先加载原始模型、Tokenizer 和 WhisperFeatureExtractor，再读 WAV 或生成合成信号，分别调用 `export_case("auto", ...)` 和 `export_case("lang", ...)`。
+
+以**内置 5 秒合成信号、auto 案例**为贯穿示例，历史基线为 `T=500、A=65、S=80`。下面的尺寸用于解释数据流，不是实际语音质量样例。
+
+| 阶段 / 调用 | 产出 | 交给下一步的内容 |
+| --- | --- | --- |
+| `load_wav` / `synth_audio` | `pcm [80000]` | 单声道 16 kHz float32 波形 |
+| `mel_extractor(...)` | `mel_valid [128,500]` | 从 attention mask 求 T，裁掉无效帧 |
+| `audio_tower_forward` | `audio_features [65,1024]` | 音频连续向量，不是文字 IDs |
+| `build_prompt` + `tok(...)` | `ids [80]`、65 个音频位置 | 模板中的音频占位与普通文本位置 |
+| 文本查表 + 音频替换 | `inputs_embeds [80,1024]` | 最终保存为 `embd.npy`，供双方 Decoder 使用 |
+
+`audio_tower_forward` 内部仍是一条连续链：
+
+```text
+Mel 按 100 帧分块
+ → 三层 Conv2d + GELU
+ → channel/frequency 展平、conv_out 投影到 896
+ → 各块局部正弦位置编码、去 padding、按时间拼接
+ → 18 层非因果音频 Transformer
+ → ln_post、proj1、GELU、proj2
+ → [A,1024]
+```
+
+音频位置数按 `A = 13×floor(T/100) + ceil((T mod 100)/8)` 计算。当前参考音频注意力调用使用 `attn_mask=None`、`is_causal=False`，因此先使用单窗口短音频；跨窗口行为不能当作已验证。脚本的窗口断言检查的是每块卷积输出宽度，不是整段 A，不能依赖它拒绝所有超长输入。
+
+[融合代码](../../tools/export_asr_reference.py#L250-L261) 是两次不同的操作：
 
 ```python
-F32_KEEP_EXTRA = {"asr.audio.ln_post.weight"}
-
-def is_f32_keep(gguf_name: str) -> bool:
-    return (gguf_name.endswith(".bias") or gguf_name.endswith("norm.weight")
-            or gguf_name in F32_KEEP_EXTRA)
+inputs_embeds = tok_embd[torch.tensor(ids, dtype=torch.long)].float()
+inputs_embeds[audio_positions] = audio_features
 ```
 
-- 全部 bias（音频层 attention/FFN bias、conv bias、proj bias）与全部 RMSNorm/LayerNorm 权重保留 F32；
-- `ln_post.weight` 是不以 `norm.weight` 结尾的 LayerNorm 权重，走显式补充集合。
-- **坑（实施中实际踩过）**：第一版用"裸子路径集合"（`{"attn_norm.weight", ...}`）做 `gguf_name in F32_KEEP` 判断，
-  永远匹配不到带层前缀的完整名（`blk.0.attn_norm.weight`），norm 被静默转成 F16——GGUF 大小几乎不变、
-  转换也不报错，直到 C++ 端跑起来才以 `binary_op: unsupported types` abort 的形式暴露。
-  **教训**：dtype 规则要用对完整名成立的谓词（后缀匹配），不要用子路径清单。
+第一行给全部 80 个位置查文本向量；第二行只把 65 个 `audio_pad` 位置换成音频向量。剩余模板标记不变，序列长度也不变。这里是**替换，不是相加，也不是把音频转写成文字再查表**。
 
-为什么 norm 必须 F32：外部 Embedding 入口的主流动中间量是 F32（见 §3.3），ggml 二元 op 不做混合精度，
-`mul(f32_rms_norm结果, f16_norm权重)` 直接崩溃。文本侧 LLM 路径中间量是 F16（get_rows 从 F16 embedding 出），
-所以 LLM 的 GGUF 里 norm 是 F16 也能跑——**dtype 决策必须与计算图主流中间 dtype 联合验证**。
+`lang` 案例在 assistant 输入后添加 `language Chinese<asr_text>`，因此同一音频的 S 与 auto 不同。当前脚本的 context 默认为空，没有任意语言/context 的 CLI 参数。
 
-### 1.4 `convert_data`：F16 溢出防线
+### 2.2 为什么 Python 还要运行 Decoder
 
-矩阵转 F16 前先检查 `amax > 65504`（F16 上限），超限直接抛错而不是静默截断成 inf。
-本模型 BF16 权重 amax 远低于该值，检查是防御性的（防止将来换模型时静默产出坏 GGUF）。
+融合输入是“题目”，还需要参考实现给出“每一步应算成什么”。[参考 Decoder](../../tools/export_asr_reference.py#L263-L318) 用 ASR 文本权重初始化 `Qwen3ForCausalLM`，以 fp32、eager attention 执行：
 
-### 1.5 `build_tokenizer`：词表三级来源与 dummy 补齐
+```text
+inputs_embeds → prefill → hidden_states + 末位 logits + past_key_values
+                              ↓
+                 argmax 选 token → token ID 单步前向
+                              ↓
+                 更新 past_key_values，保存每步 logits 与 token
+```
 
-1. `vocab.json`：151,643 个 NORMAL token 按 id 填入；
-2. `tokenizer_config.json` 的 `added_tokens_decoder`：62 个，`special=true → CONTROL(3)`，
-   非 special（如 `<asr_text>` id=151704）`→ USER_DEFINED(4)`；
-3. 剩余空位（151,705 ~ 151,935 共 231 个）补空串 NORMAL——`embed_tokens` 有 151,936 行，词表必须等长对齐。
+这里没有重新训练。参考只负责建立可重复比较的输出，C++ 不会把参考 hidden/logits 当作下一层的输入。
 
-特殊 token 推导链：`eos/bos` 从 added tokens 里按内容反查；`pad` 依次尝试 `padding_token` →
-vocab 里的 `<|endoftext|>` → eos 兜底（tokenizer_config 里没有 padding 字段，实际落到 151643）。
+最重要的下标关系是：
 
-### 1.6 契约键写入（GGUF 元数据清单）
+```text
+decode_logits[0] = prefill 末位 logits，预测 decode_ids[0]
+decode_logits[1] = 输入 decode_ids[0] 后的 logits，预测 decode_ids[1]
+decode_logits[i] = 输入前 i 个参考生成 token 后，预测第 i 个 token 的 logits
+```
 
-| 键组 | 内容 | 消费方 |
+每行 logits 有 V=151936 个原始分数，不是概率。`layer_hidden` 有 29 份状态：第 0 份为输入，1～27 为前 27 层的输出，第 28 份已经经过最终 RMSNorm。
+
+### 2.3 文件交接：哪些参与推理，哪些只用于比较
+
+每个案例导出 11 个 npy 加 WAV、JSON；**C++ 只读其中 5 个 npy**。
+
+| 文件 | 形状 / 内容 | 当前 C++ 用法 |
 | --- | --- | --- |
-| `{arch}.*`（= `qwen3-asr.*`） | 文本 Decoder 超参（embedding_length、attention.head_count 等） | `qwen3_model_load` 通用段 |
-| `asr.audio_start/end/audio_token_id` | 151669 / 151670 / 151676 | v0.2 融合逻辑；加载时校验 |
-| `asr.pad_token_id` | 151643 | v0.2+ |
-| `asr.eos_token_ids` | `[151645, 151643]`（INT32 数组，来自 generation_config.json） | 生成停止判定 |
-| `asr.chat_template` / `asr.support_languages` | 模板原文 / 语言列表 JSON | v0.2 prompt 构造 |
-| `asr.audio.*` | 音频塔超参 17 项（d_model=896、encoder_layers=18、n_window=50、conv.kernel/stride/padding 等） | `qwen3_model_load` ASR 段 |
-| `asr.mel.*` | Log-Mel 前处理契约（n_fft=400、hop=160、feature_size=128 等） | v0.3 C++ Log-Mel 对齐 |
+| `ids.npy` | `[S]`，输入 Prompt IDs | 只取长度 S，不用其内容进行 prefill 查表 |
+| `embd.npy` | `[S,1024]`，融合输入 | **实际 prefill 输入** |
+| `layer_hidden.npy` | `[29,S,1024]` | 比较逐层 hidden |
+| `decode_ids.npy` | `[G]`，参考输出 IDs | teacher forcing 输入、自由生成比较目标 |
+| `decode_logits.npy` | `[G,V]` | 第 0 行比较 prefill，后续行比较 decode |
+| `pcm.npy` / `test.wav` | 波形数组 / PCM16 WAV | 不读取；复现与播放检查 |
+| `mel.npy` | `[128,T]` | 不读取；后续音频链路参考 |
+| `audio_positions.npy` | `[A]` | 不读取；记录 Python 替换位置 |
+| `prefill_logits.npy` | `[V]` | 不读取；当前保存内容有偏差，见 §4.2 |
+| `prefill_topk_ids.npy` / `prefill_topk_vals.npy` | 各 `[10]` | 不读取；C++ 自行从完整 logits 计算 top-k |
+| `meta.json` | Prompt、T/A/S/G、采样率、参数 | 不读取；用于人工核对 |
 
-注意文本超参键带的是**架构前缀**（`qwen3-asr.embedding_length`）：gguf-py 的 writer 按
-`{arch}.xxx` 生成键名，所以 loader 侧超参读取必须用动态前缀（见 §2.3），不能写死 `qwen3.`。
+没有独立的 `audio_features.npy`，音频向量已写入 `embd.npy`；没有音频 Encoder 的逐层导出，`layer_hidden.npy` 仅指文本 Decoder。不同文件必须来自同一轮导出，不能把 auto 的输入配上 lang 的参考。
 
-### 1.7 产物与清单
+## 3. C++ 主线：从文件到一次前向，再到逐 token 生成
 
-写盘顺序：`write_header_to_file → write_kv_data_to_file → write_tensors_to_file → close`。
-同时输出张量映射清单 JSON（`--mapping-out`）：`source`（来源目录/revision 信息）、`contract`（命名/dtype 契约）、
-`summary`（text=311/audio=301、F16/F32 计数）、`mapping`（612 条：HF 名 → GGUF 名 → 层号 → dtype）。
-正式副本在 [doc/asr/asr_v01_tensor_mapping.json](asr_v01_tensor_mapping.json)。
+### 3.1 main 准备了什么状态
 
----
+[asr_align_v01.cpp](../../examples/asr/api_test/asr_align_v01.cpp#L299-L323) 中，`load_npy` 先读入上述 5 个数组。`NpyArray` 保存 shape 和连续字节，通过 `as_f32()` / `as_i32()` 提供数据指针；本链路使用小端 F32/I32、C-order 数组。
 
-## 2. 模型加载（src/model.h / model.cpp）
+随后 `S = ref_ids.shape[0]`，设置 `n_ctx = S + max_gen + 16`，并调用 `Harness::load`：
 
-### 2.1 新增数据结构
-
-**`qwen3_asr_hparams`** —— 音频塔超参 + ASR 协议 token：
-
-| 字段 | 值 | 说明 |
+| 对象 | 初始化动作 | 存活范围 |
 | --- | --- | --- |
-| `n_audio_layer` / `d_model` / `n_head` / `n_ff` | 18 / 896 / 14 / 3584 | 音频 Transformer 主体 |
-| `output_dim` | 1024 | 投影输出宽 = 文本 `n_embd`（加载时校验相等） |
-| `num_mel_bins` / `n_window` / `n_window_infer` | 128 / 50 / 800 | 分块与注意力窗口（v0.2 用） |
-| `conv_chunksize` / `max_source_positions` | 500 / 1500 | 卷积分块与正弦位置表长（v0.2 用） |
-| `conv_channels` | 480 | **不在 config 里**，加载时从 `conv1.weight` 的 ne[3] 推导 |
-| `conv_kernel/stride/padding` | 3 / 2 / 1 | 频率轴 128→64→32→16 的推导参数 |
-| `audio_start/end/pad_token_id`、`eos_token_ids` | 151669 / 151670 / 151676 / [151645,151643] | 协议 token |
+| `model` | 加载 GGUF 和 CPU 权重 buffer | 整次对齐 |
+| `tok` | 从 GGUF 加载词表，供最终 token 解码 | 整次对齐 |
+| `kv` | 每层分配 F16 K/V，初始 `n_past=0` | 跨 decode step 复用 |
+| `allocr` | 创建 ggml graph 分配器 | 跨各次前向复用 |
+| 临时 `ctx` / graph | 每次 eval 前创建，读完输出后释放 | 一次前向 |
 
-**`qwen3_asr_audio_layer`** —— 单个音频层的 16 个张量指针（attention 四投影 q/k/v/out 带 bias、
-`self_attn_layer_norm`/`final_layer_norm` 两套 LayerNorm 带 bias、普通两层 FFN fc1/fc2）。
+[KV 初始化](../../src/kv_cache.cpp#L14-L52) 为每层的 K 和 V 各分配 `8×128×n_ctx` 个 F16 元素，28 层合计每个容量位置 112 KiB。权重、KV 和临时图内存是三类不同资源，释放一次 graph 不会清除历史 KV。
 
-**`qwen3_model`** 扩展：`is_asr` 标志 + `asr_hparams` + 13 个 `a_*` 全局张量指针 + `asr_audio_layers`。
+### 3.2 eval 如何把数组交给 ggml
 
-### 2.2 加载流程中的 ASR 分支（`qwen3_model_load`）
+`Harness::eval` 是一次前向的编排器，`qwen3_build_graph` 是计算图描述器。**构图不等于已经执行**，真正执行发生在 `ggml_backend_graph_compute`。
 
+```mermaid
+sequenceDiagram
+    participant Main as main / 验证循环
+    participant Eval as Harness::eval
+    participant Graph as qwen3_build_graph
+    participant Back as ggml backend
+    participant KV as 持久 KV buffer
+    Main->>Eval: tokens 或 embd_in，n_tokens，n_past
+    Eval->>Eval: 填 gp；外部输入时创建 F32 embd 张量
+    Eval->>Graph: ctx、model、kv、gp
+    Graph-->>Eval: graph 描述，包含 KV 读写与 logits 节点
+    Eval->>Back: 分配 graph 所需内存
+    Eval->>Back: 写入 Embedding/IDs、positions、mask
+    Eval->>Back: graph_compute
+    Back->>KV: 各层写本次 K/V、读取合法历史
+    Back-->>Eval: 末位 logits
+    Eval->>Eval: kv.n_past = n_past + n_tokens
+    Eval-->>Main: graph 与 logits_out
+    Main->>Main: 读取逐层输出（如需要），释放临时 ctx
 ```
-gguf_init_from_file(no_alloc=true)
-  → arch 校验："qwen3" 或 "qwen3-asr"，否则报错退出
-  → model.is_asr = (arch == "qwen3-asr")
-  → 动态键前缀 P = arch + "."          // "qwen3.xxx" / "qwen3-asr.xxx" 通用读取
-  → 文本超参 + 28 层权重（与 LLM 完全同路径）
-  → if (model.is_asr):
-      → 读 asr.* 元数据（audio token id、eos_token_ids INT32 数组）
-      → 校验 output_dim == n_embd
-      → conv1.weight 形状自检 + conv_channels 推导
-      → get_a() 逐个取 13 个全局张量 + 18×16 个层张量，全部带形状校验
-      → 任一缺失/形状不符 → 整体加载失败（不静默丢弃音频权重）
-```
 
-三个实现要点：
-
-1. **`get_a` lambda 的形状校验**：期望形状以 `std::initializer_list<int64_t>` 传入，
-   先比 `ggml_n_dims` 再逐维比 `ne[]`；失败时打印 want/got 完整形状串（如 `want 896x3584 got 3584x896`），
-   而不是只报维度数——没有这个信息，§6 的 ne 方向坑几乎无法定位。
-2. **mul_mat 权重的 ne 约定**：`ne[0]=in_features, ne[1]=out_features`（PyTorch `[out,in]` 经 gguf-py 写入后自动反转）。
-   `fc1` 期望 `{896, 3584}`、`fc2` 期望 `{3584, 896}`、`proj2` 期望 `{896, 1024}`。
-   注意对称矩阵（attn_q 等 896×896）写反也校验通过——**校验逻辑对不对称张量无区分度**，依赖转换侧正确性。
-3. **conv 通道数自推导**：480 不在 config.json 中（Whisper 系传统硬编码），从 `conv1.weight` 的 `ne[3]` 读出，
-   再用 `conv_out_len`（k=3/s=2/p=1 的输出长度公式）连算三次验证 `conv_out.weight` 的 ne[0] = 480×16 = 7680。
-   超参与张量互为证据，转换或配置错误在加载期即暴露。
-
----
-
-## 3. 计算图（src/graph.h / graph.cpp）
-
-### 3.1 图输入/输出契约（相对 LLM v0.2 的变化）
-
-| 宏 | 名字 | 类型/形状 | 状态 |
-| --- | --- | --- | --- |
-| `QWEN3_TENSOR_NAME_TOKENS` | `tokens` | I32 `[n_tokens]` | 保留（embd 入口时不创建） |
-| `QWEN3_TENSOR_NAME_EMBD` | `embd` | F32 `[n_embd, n_tokens]` | **新增**，外部融合 Embedding |
-| `QWEN3_TENSOR_NAME_POS` | `positions` | I32 `[n_tokens]` | 保留 |
-| `QWEN3_TENSOR_NAME_MASK` | `kq_mask` | F32 `[n_kv, n_tokens]` | 保留 |
-| `QWEN3_TENSOR_NAME_LOGITS` | `logits` | F32 `[n_vocab, **1**]` | 形状变化（原 `[n_vocab, n_tokens]`） |
-| `QWEN3_TENSOR_NAME_LAYER_OUT_PREFIX` | `layer_out_{i}` | F32 `[n_embd, n_tokens]` | **新增**，`want_layer_outputs=true` 时存在 |
-
-`embd` 与 `tokens` 互斥。注意 `embd` 的传入方式：**调用方**在 no-alloc ctx 里创建 F32 张量、`set_input`、
-经 `qwen3_graph_params.embd` 传入，图内直接以它为第 0 层输入——不是"传裸指针数据、图内自建"，
-也不需要事后按名字查找（调用方自己持有指针，alloc 后直接 `ggml_backend_tensor_set`）。
-
-### 3.2 `qwen3_graph_params`
+两个入口仅影响第 0 层之前的输入来源：
 
 ```cpp
-struct qwen3_graph_params {
-    int32_t n_tokens = 0;
-    int32_t n_past   = 0;
-    int     max_nodes = 0;
-    struct ggml_tensor * embd = nullptr;  // 非空走外部 Embedding 入口
-    bool logits_last_only   = true;       // 仅对最后位置执行 LM Head（默认开）
-    bool want_layer_outputs = false;      // 导出每层残差输出（对齐工具用）
-};
-```
-
-签名从 `qwen3_build_graph(ctx, model, kv, n_tokens, n_past, max_nodes)` 改为 params 结构体——
-新增开关（embd/logits_last_only/want_layer_outputs）不再膨胀位置参数。
-
-### 3.3 双入口的第 0 层输入
-
-```cpp
-struct ggml_tensor * tokens = nullptr;
-if (!params.embd) { /* 创建 tokens 输入 */ }
-struct ggml_tensor * embd_in = params.embd;          // 调用方创建的输入张量
-...
 struct ggml_tensor * x = params.embd ? embd_in
                                      : ggml_get_rows(ctx, model.tok_embd, tokens);
 ```
 
-**dtype 传播差异**：LLM 路径 `x` 是 F16（`get_rows` 从 F16 embedding 查表），ASR embd 路径 `x` 是 F32
-（外部输入本身就是 F32）。28 层计算对两种 dtype 都成立的前提是 §1.3 的 norm F32 规则——
-`mul(任何中间量, f32_norm)` 都合法，反之 F16 中间量 × F16 norm 也合法，唯独 f32×f16 崩溃。
+- **prefill：**传 `embd_in`、`n_tokens=S`、`n_past=0`，不创建 token 输入。NumPy `[S,1024]` 与 ggml `ne=[1024,S]` 都是每个位置的 1024 个数连续存放，所以直接拷贝，不做物理转置。
+- **decode：**传一个 token ID、`n_tokens=1`、`n_past=已有位置数`，从 GGUF 的 `token_embd` 查出向量，然后走相同的 28 层。
 
-### 3.4 仅末位 LM Head（`logits_last_only`）
+位置和 mask 由 eval 写入，不从参考文件加载：
 
-```cpp
-if (params.logits_last_only) {
-    struct ggml_tensor * x_last = ggml_view_1d(ctx, x, hp.n_embd,
-            (int64_t)(n_tokens - 1) * hp.n_embd * ggml_element_size(x));
-    logits = ggml_mul_mat(ctx, model.output, x_last);   // [n_vocab, 1]
-}
+```text
+positions[q] = n_past + q
+n_kv = n_past + n_tokens
+mask[q,k] = -∞，当 k > n_past + q；否则为 0
 ```
 
-- prefill S=80 时，LM Head 计算量从 151936×1024×80 缩减 80 倍，输出张量从 ~48MB 缩到 ~0.6MB；
-- `x_last` 是 view（零拷贝），offset 指向内存里最后一个 token 的 1024 个 F32（`x` 内存 token 主序）；
-- **对 LLM 行为无影响**：inference_engine 只读最后位置的 logits，原本就要丢弃其余 S-1 列；
-  相应地 engine 读 logits 的偏移从 `(n_tokens-1)*n_vocab` 改为 **0**（logits 恒为 [n_vocab,1]）。
-- ASR 侧唯一的例外消费者是"逐层 hidden 对齐"（want_layer_outputs 与 last_only 正交，互不干扰）。
+第一次 prefill 是三角因果可见关系；单 token decode 可见全部已写入的历史和当前位置。graph 为每层计算：
 
-### 3.5 逐层输出导出
-
-```cpp
-if (params.want_layer_outputs) {
-    struct ggml_tensor * layer_out = ggml_cont(ctx, x);   // 拷贝一份，防后续层原地复用
-    ggml_set_name(layer_out, (std::string(QWEN3_TENSOR_NAME_LAYER_OUT_PREFIX) + std::to_string(il)).c_str());
-    ggml_set_output(layer_out);
-    ggml_build_forward_expand(gf, layer_out);
-}
+```text
+RMSNorm → Q/K/V 投影 → QK-Norm → Q/K RoPE
+ → K/V 写入 [n_past, n_kv)，读取 [0, n_kv)
+ → 因果 GQA → 输出投影 + 残差
+ → RMSNorm → gate/up → SiLU(gate) × up → down + 残差
 ```
 
-三件事缺一不可：`ggml_cont` 固化（`x` 在下一层会被继续计算，若直接引用会读到最终值）、
-`set_output` 标记、`build_forward_expand` 把它挂进图（否则 dead node 被 gallocr 忽略）。
-语义与 transformers 的 `output_hidden_states` 对齐：`layer_out_{i}` = 第 i 层残差输出（final norm 之前），
-即参考里的 `hidden_states[i+1]`。
+28 层后执行 Final RMSNorm，取最后位置的 hidden 做 LM Head，得到 `[V]`。`gp.logits_last_only=true` 避免生成全序列 `[V,S]` logits；`want_layer_outputs` 则独立控制是否保留 `layer_out_i` 供比较。
 
-KV cache 的读写路径（`cpy` 写 `[n_past, n_past+n_tokens)`、view 读 `[0, n_kv)`）与 LLM v0.2 完全一致，未改动。
+### 3.3 三段验证为什么要分开
 
----
+[main 的三段循环](../../examples/asr/api_test/asr_align_v01.cpp#L327-L466) 共用 eval，但输入策略不同：
 
-## 4. 参考基线导出（tools/export_asr_reference.py）
-
-### 4.1 测试音频：合成（`synth_audio`）与真人语音（`--wav`）
-
-5 秒 16kHz：110~220Hz 慢扫描基频 + 2/3 次谐波 + 4Hz 音节包络 + 轻噪声（seed 固定）。
-v0.1 验收目标是数值对齐，不追求可识别语音；合成信号保证 Mel 有效帧满 500（= 5 个完整 CNN 块，A=65），
-落在单注意力窗口（v0.1 基线假设 A ≤ 104）内。
-
-**真人语音入口**（`load_wav`）：`--wav path` 用真实语音替代合成音频——
-单声道化（立体声取平均）、位宽归一（8/16/32-bit PCM → float32 [-1,1]）、非 16k 线性插值重采样。
-其余全链路（mel → A 断言 → prompt → 生成 → 导出）对时长/内容完全动态；
-`--max-new-tokens` 可放宽生成上限（真人语音转写比合成音频长，默认 32 可能截断）。
-注意两点：① 环境无 librosa/soundfile，重采样是简单线性插值，TTS 端直接选 16k 输出质量最佳；
-② 真人语音下 auto 案例会输出 `language Chinese<asr_text>` + 真实转写，与合成音频的 `language None` 不同。
-
-### 4.2 音频塔 fp32 复现（`audio_tower_forward`）
-
-逐行对齐官方 `modeling_qwen3_asr.py@7c6daf77`，全部 fp32：
-
-1. **100 帧分块**：`chunk_num = ceil(T/100)`，尾块长度 `T % 100`（为 0 时补 100），`pad_sequence` 对齐；
-2. **三层 Conv2d + GELU**（stride 2 / padding 1），`permute(0,3,1,2).view(b,t,c*f)` 按 **channel 再 frequency** 展平；
-3. **局部正弦位置编码**：`sinusoids(1500, 896)` 截前 `x.shape[1]`，加在 padded 长度上（每个块从 0 重启）；
-4. **`padded_mask_after_cnn` 挑出有效位置** → `[A, 896]`，并断言 `A == 13×⌊T/100⌋ + ⌈(T%100)/8⌉`；
-5. **18 层**：LayerNorm → MHA（非因果无 mask，`scale=1/√64`）→ 残差 → LayerNorm → fc1 → GELU → fc2 → 残差；
-6. **输出**：ln_post → proj1 → GELU → proj2 → `[A, 1024]`。
-
-### 4.3 Prompt 与融合
-
-`build_prompt`：官方 chat_template 结构（system 空 context + user 音频段 + assistant 尾），
-`lang` 模式在 assistant 侧追加 `language Chinese<asr_text>` 前缀。融合是**替换**非相加：
-
-```python
-inputs_embeds = tok_embd[ids].float()          # [S, 1024] 行=token
-inputs_embeds[audio_positions] = audio_features  # A 个 audio_pad 位置替换为音频特征
-```
-
-### 4.4 Decoder 基线的 tie_word_embeddings 决策
-
-用 transformers `Qwen3ForCausalLM` 加载 ASR 文本子模型（与 Qwen3 同构；MRoPE 三轴相同退化为一维 RoPE，
-官方 eager attention）。权重重映射 `thinker.model.* → model.*`、`thinker.lm_head.weight → lm_head.weight`。
-
-关键点是 `tie_word_embeddings=False`：官方 config 里 tie=true，但 safetensors 里 embed 与 lm_head 是
-**两份不同数据**（官方推理时 lm_head 覆盖 tie 张量）。若按 tie=true 加载，lm_head 数据会覆盖 embed_tokens，
-与官方行为不一致。显式关掉 tie 让两份矩阵独立生效，与 GGUF（双份保留）和 C++ 侧（`output` 独立读取）一致。
-
-### 4.5 导出产物（每案例 11 个 npy + wav/meta）
-
-| 文件 | 形状 | 消费方（asr_align_v01） |
-| --- | --- | --- |
-| `pcm.npy` / `test.wav` | [80000] | 复现参考/人工检查 |
-| `mel.npy` | [128, T] | v0.2 对齐 Mel |
-| `ids.npy` | [S] | prefill 长度 S |
-| `audio_positions.npy` | [A] | 校验 audio_pad 位置 |
-| `embd.npy` | [S, 1024]（行=token） | **embd 入口数据**（与 ggml [n_embd, S] 内存布局一致） |
-| `layer_hidden.npy` | [29, S, 1024] | 逐层 hidden 对比（[0]=embed 输出，[i]=第 i 层输出） |
-| `prefill_logits.npy` / `prefill_topk_*.npy` | [vocab] / [10] | prefill 末位对比 |
-| `decode_ids.npy` | [n_gen] | teacher forcing 输入 + 自由生成对比 |
-| `decode_logits.npy` | [n_gen, vocab] | 每步 logits 对比 |
-| `meta.json` | — | 案例参数（T/A/S/n_gen/Mel 参数） |
-
-两个案例：`auto`（T=500, A=65, S=80, n_gen=4）与 `lang`（S=83, n_gen=3）。
-用 `--wav` 真人语音时 T/A/S/n_gen 随音频变化（如 8s → T=800, A=104, S=119），meta.json 记录实际值。
-
----
-
-## 5. 数值对齐工具（examples/asr/api_test/asr_align_v01.cpp）
-
-### 5.1 `NpyArray`：最小 npy 读取器
-
-只支持 v1.0 格式、fortran_order=false、`<f4`/`<i4`。**坑（实施中踩过）**：shape 是括号元组
-（`'shape': (29, 80, 1024)`），不能像 descr 那样在第一个逗号处截断——截断后 `(80, 1024)` 只读到 `80`，
-count 少算 1024 倍，后续按完整尺寸 `tensor_set` 时**越界读堆内存**，垃圾数据（NaN/FLT_MAX）灌满整个链路，
-表象是"所有输出 NaN"而真因在读取器。修复：专门按括号界截取 shape 串。
-
-### 5.2 误差统计（`ErrStats` / `topk_overlap`）
-
-- `ErrStats`：max_abs / rmse / n / **has_nan**。NaN 单独标记的原因：`std::max(0.0, NaN)` 返回 0.0，
-  NaN 会把 max_abs 伪装成 0，而 rmse=sqrt(NaN)=NaN——早期输出里 "max_abs=0 rmse=-nan" 这种矛盾组合
-  正是全 NaN 数据的特征，显式标记后诊断不再歧义。
-- `topk_overlap`：两个 logits 向量 top-10 集合的交集大小。**坑**：第一版比较器是"返回 lambda 的 lambda"
-  （内层按引用捕获外层的形参，外层临时对象销毁后悬垂），叠加 NaN 破坏严格弱序导致 `partial_sort`
-  内部堆操作越界段错误。修复：比较器直接捕获调用方指针（生命周期覆盖函数体）。
-
-### 5.3 `Harness`：模型/KV/tokenizer + 单步 eval
-
-```cpp
-struct ggml_cgraph * eval(ggml_context * ctx, const int32_t * tokens,
-                          const float * embd_in, int32_t n_tokens, int32_t n_past,
-                          bool want_layers, std::vector<float> & logits_out);
-```
-
-- embd 入口：在 ctx 创建 `[n_embd, n_tokens]` F32 张量 → `set_input` → `gp.embd = ...` →
-  alloc 后用自持指针灌数据；token 入口：按名取 `tokens` 灌 id。
-- positions = `n_past + i`（增量 decode 的绝对位置）；mask = `[n_kv, n_tokens]` 下三角 -inf。
-- 每步 `ggml_init/ggml_free` 新建临时 ctx（图形状随 n_tokens 变化），`allocr` 复用。
-- `kv.n_past = n_kv` 由 eval 收尾维护。
-
-### 5.4 三段验证
-
-1. **prefill（embd 入口，逐层导出开）**：S 个 token 一次前向。
-   对比 28 层 `layer_out_i` vs `hidden_states[i+1]`（`[0]` 是 embedding 输出，另做 embd 输入直通校验）；
-   末位 logits vs `decode_logits[0]` + top-10 命中。
-2. **teacher forcing**：第 i 步（i≥1）输入**参考序列**的 `dids[i-1]`、`n_past = S + i - 1`，
-   对比 `decode_logits[i]`。参考与被测吃完全相同的 token 序列，把"数值误差"和"生成路径分叉"解耦。
-3. **自由贪心生成**：`kv.n_past = 0` 重置后从 embd prefill 开始 argmax 循环（EOS 集合取自
-   `asr_hparams.eos_token_ids`），对比 token 序列前缀完全一致，并打印 decode 后文本。
-   `n_ctx = S + max_gen + 16` 用生成上限而非参考长度预留余量——**argmax 若分叉，
-   生成会超过参考长度，n_ctx 不足时 view_1d 写 KV 越界 abort**（实施中实际发生过）。
-
-### 5.5 容差与 attention sink（实测建立）
-
-| 判定 | 阈值 | 实测（auto / lang） |
-| --- | --- | --- |
-| 逐层 hidden（**排除 token 0** 的 rmse，末层豁免） | ≤ 0.05 | ≤ 0.017 / ≤ 0.017 |
-| prefill/decode logits max_abs | ≤ 0.5 | 0.055 / 0.032 |
-| top-10 命中 | ≥ 9/10 | 10/10 |
-| 自由生成 | 与参考完全一致 | 4/4、3/3 |
-
-为什么这样设计（现象与依据详见 [design_asr_v0.x.md §2.6](design_asr_v0.x.md)）：
-`<|im_start|>`（token 0）是 attention sink，hidden 达 10³ 量级，F16 KV 量化误差在该位置逐层放大
-（全量 max_abs 最大约 400），但相对误差仅 ~0.15%，末位 logits 与生成不受影响。
-全量 max_abs 判定必然误判 FAIL，所以：
-
-- hidden 用**排除 token 0 后的 rmse**；
-- 末层 hidden 不单独判定——`logits_last_only` 下它的唯一消费者是末位 logits，由 logits 判定覆盖；
-- 功能正确性锚定在 logits/top-k/生成一致性上。
-
----
-
-## 6. 实施中踩过的坑（速查表）
-
-| # | 现象 | 根因 | 修复 |
+| 阶段 | 输入来自哪里 | 保留 / 重置什么 | 回答的问题 |
 | --- | --- | --- | --- |
-| 1 | C++ 侧 `binary_op: unsupported types dst f32, src0 f32, src1 f16` abort | F32 保留清单用裸子路径匹配不到完整张量名，norm 全被转 F16；F32 embd 入口下 mul 混精度崩溃 | dtype 改后缀规则（`*.bias`/`*norm.weight`）+ 显式补充 |
-| 2 | 加载期 `has unexpected shape` 但只有维度数 | `fc1/fc2/proj2` 期望形状按 `{out,in}` 写，实际 ne={in,out}；对称张量错而不报 | 按 ggml 约定修正 + 失败时打印 want/got 完整形状 |
-| 3 | 对齐工具全链路 NaN、embd_input 对比出现 FLT_MAX | npy shape 元组在逗号处截断，count 少算 → tensor_set 越界读堆 | shape 按括号界解析 |
-| 4 | `partial_sort` 段错误 | 嵌套 lambda 悬垂引用 + NaN 破坏严格弱序 | 比较器直接捕获调用方指针；NaN 显式标记 |
-| 5 | 自由生成段 `ggml_view_1d` assert | argmax 分叉后生成超过参考长度，n_ctx 不足 → KV 写越界 | n_ctx 按 max_gen 预留 |
-| 6 | sink 位置 hidden 偏差 0.5→400，全量 max_abs 判定必 FAIL | F16 KV 量化误差在 10³ 量级 sink 上逐层放大 | ex-sink rmse 判定 + 末层豁免 + 功能输出锚定 |
+| Prefill | `embd.npy` | 从空历史建立 S 个位置的 KV | 同一混合输入是否得到相近 hidden 和首步 logits？ |
+| Teacher forcing | `decode_ids.npy` 的前一个参考 token | 接着 prefill 的 KV 逐步追加 | 固定相同历史时，增量计算是否一致？ |
+| 自由贪心生成 | 首步 Embedding，之后自己 argmax 的 token | 重置有效历史，重新 prefill | 不给参考 token 引导，能否生成相同序列？ |
 
----
+仍以 `S=80`、假设参考生成 `G=4` 为例，teacher forcing 的状态变化是：
 
-## 7. 与 LLM 代码的共享面（改动影响一览）
+| 调用 | 输入 | n_tokens | n_past（调用前） | n_past（调用后） | 比较对象 |
+| --- | --- | ---: | ---: | ---: | --- |
+| Prefill | 80 个融合向量 | 80 | 0 | 80 | `decode_logits[0]` |
+| Decode 1 | 参考 `decode_ids[0]` | 1 | 80 | 81 | `decode_logits[1]` |
+| Decode 2 | 参考 `decode_ids[1]` | 1 | 81 | 82 | `decode_logits[2]` |
+| Decode 3 | 参考 `decode_ids[2]` | 1 | 82 | 83 | `decode_logits[3]` |
 
-| 文件 | 改动 | 对 LLM 路径的影响 |
+这解释了为什么 G 个输出 token 只需要 G−1 次增量前向：第一个 token 由 prefill 预测。teacher forcing 不更新权重，也不使用 C++ argmax 结果作为下一步输入，避免一次选词分歧把后续路径全部带偏。
+
+自由生成开始前，程序把 `kv.n_past` 和循环的 `n_past` 归零；并不重新分配或清零整个 KV buffer。重新 prefill 从头覆盖有效区域，attention 只读本次有效范围，旧尾部数据不参与计算。
+
+之后每步选择 logits 最大的 token，追加到 `gen`；命中 GGUF 的 EOS 集合或达到 `max_gen` 即退出。最终用 `tok.decode(gen, false)` 打印原始文本，保留语言协议及 special tokens，尚未整理为独立的 language/text 响应。
+
+## 4. 结果判定与排查：先看哪一段出问题
+
+### 4.1 工具实际比较什么
+
+| 检查项 | 当前实现 |
+| --- | --- |
+| 逐层 hidden | 比较 `layer_out_i` 与参考第 i+1 份状态；对前 27 层，排除序列位置 0 后的 RMSE 超过 0.05 则失败 |
+| Prefill logits | 与 `decode_logits[0]` 比较；max_abs ≤ 0.5 且 top-10 集合重合至少 9 个 |
+| Teacher forcing logits | 汇总各增量步的最差 max_abs 与 top-10 重合数，阈值同上 |
+| 自由生成 | 总长度相等且逐 token 相同；不只是已有前缀相同 |
+
+序列位置 0 在历史基线中具有 attention sink 的大幅值特征，因此代码打印全量与排除首位置两套统计，以后者参与 hidden 阈值判断。**位置 0 不是词表 ID 0。**
+
+还有一个取值点差异：C++ `layer_out_27` 位于最后一层残差后、Final RMSNorm 前；Python `hidden_states[28]` 已经过最终归一化。当前仍打印该组比较，但不纳入 hidden 判定，不能把两者的差值全部归因为 F16 误差。末位 logits 检查覆盖最终归一化与 LM Head 输出。
+
+`embd_input` 只是 `embd.npy` 与参考第 0 份 hidden 的数据一致性打印，不是额外的音频融合验证。历史合成案例的验收结果见 [design_asr.md](design_asr.md)，不能把该结果泛化为任意录音准确率。
+
+### 4.2 当前参考与工具的已知限制
+
+这些是现有代码行为说明，本次文档整理不修改推理代码：
+
+- **prefill 文件命名与内容不一致。**Python 在生成循环结束后保存 `prefill_logits.npy`，此时变量已是最后一步 logits；当前 C++ 不读它，而使用 `decode_logits.npy[0]`。
+- **两端生成上限语义不同。**Python 循环结束还保存一步，G 可能为 `max_new_tokens+1`；C++ 最多保存 `max_gen` 个 token。需要覆盖参考长度，且应让参考自然到 EOS，不能把截断序列当成完整答案。
+- **NaN 提示不等于完整失败判定。**`ErrStats` 遇到 NaN 会标记并跳过该差值，main 没有统一以 `has_nan` 增加失败数；出现非有限值时不能仅依据 PASS 判断计算正常。
+- **文件读取器是最小实现。**链路约定使用本脚本导出的 npy，不是通用、严格校验任意数组的文件接口；不要混用 shape、dtype、案例或模型版本。
+- **单窗口参考不证明长音频正确。**音频塔当前无跨窗口 mask；超过短音频范围需另行核对官方后端语义，而不是仅放大 KV 容量。
+
+### 4.3 沿交接点定位，避免所有问题都归到 Decoder
+
+| 最先异常的位置 | 先检查的交接点 | 源码 |
 | --- | --- | --- |
-| model.h / model.cpp | 新增 `is_asr` 分支、ASR 结构体、`arch` 校验放宽为二选一、超参键前缀动态化 | 无（qwen3 键名经 P 拼接结果不变） |
-| graph.h / graph.cpp | 新增 params 结构体、embd 入口、last_only、逐层导出 | last_only 改变 logits 形状，engine 读偏移同步改为 0，行为等价（回归通过） |
-| inference_engine.cpp | 适配新签名；logits 读取 offset 0 | 等价改写 |
-| kv_cache / tokenizer / sampler / common / qwen3_chat | **零改动** | 无 |
-| convert_hf_to_gguf.py | **零改动**（ASR 转换是独立脚本） | 无 |
+| 模型转换 / 加载 | 张量命名、dtype、`ne` 方向、模型 revision；特别是非方阵形状 | `map_tensor_name`、`convert_data`、`get_a` |
+| Python 输入 | 采样率、有效 T、A 公式、占位数与融合顺序 | `load_wav`、`audio_tower_forward`、`export_case` |
+| C++ 首次前向全异常 | npy shape/dtype、S、拷贝字节数、norm 类型与算子兼容性 | `load_npy`、`Harness::eval` |
+| Prefill 正常、decode 偏差大 | 位置是否从 S 继续、KV 写入偏移与 mask、参考行下标 | `eval`、`qwen3_build_graph` |
+| Teacher forcing 正常、自由生成不一致 | argmax 分叉、EOS、生成上限、重置后的有效历史 | main 自由生成循环 |
+| 数值对齐但文字不符合录音 | 输入音质、语言前缀、模型识别能力与参考本身 | Python/C++ 原始 token 和文本 |
 
-回归证据：LLM 四类示例（nothink/yesthink × stream/blocking，各 3 测试）全部通过；
-ASR 两案例对齐 PASS（报告见 [asr_v01_align_report_auto.log](asr_v01_align_report_auto.log) /
-[asr_v01_align_report_lang.log](asr_v01_align_report_lang.log)）。
-
----
-
-## 8. 后续演进（v0.2 的接入点）
-
-| v0.2 需求 | v0.1 已备 | 待实现 |
-| --- | --- | --- |
-| 音频塔计算 | 301 张量已加载且布局按 im2col 兼容；conv 通道数/频率轴尺寸已推导 | ggml 图：分块 conv2d + GELU、channel/freq 展平、正弦位置、18 层双向注意力（非因果、无 mask） |
-| Prompt/融合 | tokenizer 已含 `<asr_text>` 等 added tokens；`asr.*` 协议 token 就绪 | ChatML 拼装 + audio_pad 扩展 + embd 替换（复用 embd 入口） |
-| 生成协议 | EOS 集合已进 `asr_hparams.eos_token_ids` | 语言前缀约束、`<asr_text>` 响应解析 |
-| Mel 对齐 | `asr.mel.*` 契约键 + 参考 mel.npy | （v0.3）C++ Log-Mel |
+阅读到这里，主线应可以串成一句话：**GGUF 提供权重，Python 提供融合输入和参考输出，eval 负责一次前向的输入与执行，graph 负责算子与 KV 依赖，main 负责三种验证策略和最终判定。**

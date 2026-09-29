@@ -164,27 +164,45 @@ llm/v1.0
 ### 4.2 要实现的内容
 
 1. **PCM/WAV 输入**：核心接口接收单声道 16 kHz float32 PCM；示例支持 PCM16 WAV，采用 `/32768` 转换。其他采样率和格式明确拒绝，不只修改采样率标签。
-2. **C++ Log-Mel**：400 点 FFT、160 点 hop、周期 Hann、reflect padding、128 维 Slaney Mel、log10 压缩与官方归一化；对齐最后帧删除和有效长度。
+2. **C++ Log-Mel**：纯 DSP 前处理，输入 PCM 输出 `[128,T]` Mel；实现方式、参数来源与差异点清单见 §4.3。
 3. **最小阻塞接口**：提供独立 `AsrEngine` 的 `Init`、`Transcribe`；请求包含 PCM、采样率、context、language 和生成上限，响应包含 text、language、完成原因和调试输出能力。
 4. **离线编排**：每请求重置 Decoder KV；一次音频编码后完成混合 prefill 和增量 decode，不在每个生成 step 重跑音频塔。
 5. **生成约束**：默认贪心、关闭重复惩罚，正确处理 EOS 集合、`<asr_text>`、指定语言前缀、长度截断和上下文不足。
 6. **输入边界**：初始公开范围建议为单请求、单音频、不超过 8 秒；校验空输入、NaN/Inf 和容量，超限报错，不静默截断。这是工程边界，不是模型能力上限。
 
-### 4.3 完成后的效果
+### 4.3 C++ Log-Mel 实现方案
+
+**先厘清音频塔边界。** `audio_tower` = 3 层 Conv2d + 18 层音频 Transformer + 输出投影（LayerNorm/proj1/GELU/proj2），共 **301 个张量**（GGUF `asr.audio.*`），其 ggml 计算属 v0.2。**Log-Mel 前处理不属于音频塔**：无权重、纯 DSP，输入 PCM、输出 `[128,T]` Mel，是 v0.3 在音频塔之前新增的独立模块。
+
+**实现方式：剥离移植 whisper.cpp 纯 DSP 部分。** Log-Mel 与 Whisper 同源，以其 STFT / mel filterbank / log 归一化为参考，只抽取纯 DSP 代码独立成模块，不整包引入 whisper 推理（`third_party/` 当前仅 ggml）；不采用 Kaldi Fbank（预加重、Povey 窗、ln 与本模型不一致）。结构参数从 GGUF `asr.mel.*` 读取，不硬编码（v0.1 已固化 `sampling_rate=16000 / n_fft=400 / hop_length=160 / feature_size=128 / padding_side=right`）。
+
+**需逐项核对与 `WhisperFeatureExtractor` 对齐的差异点：**
+
+| 差异点 | 要求 |
+| --- | --- |
+| Slaney filterbank | mel scale 与 normalization 均为 Slaney，0~8000 Hz；核对 whisper.cpp filterbank 生成公式 |
+| 窗函数 | 周期 Hann，非 Povey |
+| 预加重 / dither | 无，不得引入 Kaldi 式预加重或 dither |
+| 对数与归一化 | `log10(max(mel,1e-10))` → `max(log_mel, max-8)` → `(log_mel+4)/4` |
+| 有效帧裁剪 | 按 attention_mask 取有效帧 T 裁掉 padding；对齐居中 STFT、reflect padding、末帧删除 |
+
+**验证标准：** 对同一段 `pcm.npy` 计算 Log-Mel，与 Python 导出的 `mel.npy`（golden）逐帧对比 max_abs / RMSE，达标后才接入音频塔；Mel 是音频链路第一道关口，错了后续全错。
+
+### 4.4 完成后的效果
 
 - 用户可以输入一条支持格式的短音频，直接得到语言和转写文字。
 - 支持自动语言、指定语言和 context；整个推理链路不再依赖 Python。
 - 能明确区分识别完成、生成截断和输入错误。
 - 同一工程继续提供原有 LLM 能力，ASR 与聊天接口相互独立。
 
-### 4.4 交付物与验收标准
+### 4.5 交付物与验收标准
 
 - 交付 C++ 音频前端、最小 ASR API、配置样例及 `examples/asr/api_test/` 离线示例。
 - 对齐 PCM → Mel → 音频特征 → 融合输入 → token → 文本全链路。
 - 覆盖短中文、英文、数字、标点、静音，以及自动/指定语言、空/非空 context。
 - 重复调用不串 KV，错误和截断状态明确；LLM 与前序数值测试回归通过。
 
-### 4.5 本版不实现
+### 4.6 本版不实现
 
 不承诺长音频、文本流式、麦克风流式、GPU、量化、重采样、多种压缩格式或时间戳。
 

@@ -1,349 +1,179 @@
-# frostfall.llm
+# frostfall.llm — Qwen3-ASR 推理
 
-> 基于 **ggml v0.15.3** 的极简教学版大模型推理框架，目标模型：**Qwen3-0.6B（LLM）** 与 **Qwen3-ASR-0.6B（ASR）**。
->
-> 设计目标：用尽量少、尽量清晰的 C++ 代码，把"加载模型 → 分词 → 构图 → 前向 → 增量解码"的完整链路跑通，
-> 并把同一套 Decoder 链路复用到语音识别。
+基于 **ggml + C++17** 的本地推理工程。本文介绍当前 **asr/v0.1** 的功能、环境准备和音频转写验证方法。
 
----
+## 当前功能与使用边界
 
-## 当前版本：v1.0
+asr/v0.1 是 **Decoder 数值对齐验证版**：Python 处理音频并导出融合 Embedding，C++ 加载 GGUF 后独立执行 Decoder，生成 token、显示原始转写输出，并与 Python 参考结果比较。
 
-v1.0 在 v0.3（自研分词 + 增量 KV cache + 采样策略）的基础上，把"命令行 demo"升级为
-**可被业务集成的通用推理接口**：命令行程序 `frostfall` 已下线，仓库产出改为共享库
-`libfrostfall.so` + 一组调用示例（`examples/llm/api_test`）。
-
-- **统一推理接口** `Frostfall::InferenceEngine`：一个 `Infer()` 同时覆盖流式 / 非流式，签名对齐
-  OpenAI Chat Completions 的语义（`role`、`finish_reason`、`tool_calls`）。
-- **Thinking 分离**：`<think>…</think>` 思考段自动从正文中切出，单独放进 `LlmResponse.thinking`。
-- **Tool Call 分离**：模型输出里的 `<tool_call>…</tool_call>` 自动解析成结构化 `ToolCall`。
-- **无状态多轮对话**：业务每次传入完整 `messages`（含历史与工具结果），引擎内部每次 `Infer` 自动重置 KV cache。
-- **配置化初始化**：`EngineConfig` 支持结构体 / JSON 文件 / JSON 字符串三种初始化入口。
-- **线程安全 + 可取消**：`Cancel()` 可在任意线程调用，打断正在进行的生成。
-
-v0.1~v0.3 的自研 Tokenizer、增量 KV cache、采样策略（temperature / top-k / top-p / 重复惩罚 / seed）
-均在库内部保留，只是不再通过命令行参数暴露，而是通过 `EngineConfig.sampling`（引擎级固定配置）传入。
-
-ASR 主线（Qwen3-ASR-0.6B）已推进到 **asr/v0.1**：ASR GGUF 转换与加载、Decoder 双入口
-（tokens / 外部 Embedding）、仅末位 LM Head，并以 Python fp32 参考基线完成数值对齐
-（合成音频与真人语音均已验证，真人语音可复现转写文本）。版本规划见 `doc/asr/design_asr.md`。
-
-
----
-
-## 目录结构
-
-```
-frostfall.llm/
-├── src/
-│   ├── inference_engine.{h,cpp}  # 引擎门面：Init / Infer / Cancel / GetLastStats
-│   ├── llm_types.h               # 协议类型：Role/Message/ToolCall/LlmRequest/LlmResponse/SamplingParams
-│   ├── qwen3_chat.{h,cpp}        # Qwen3 ChatML 编解码：PromptBuilder + ThinkSplitter + ToolCallSplitter
-│   ├── model.{h,cpp}             # GGUF 加载，qwen3_model 权重结构体（LLM + ASR 音频塔张量）
-│   ├── graph.{h,cpp}             # qwen3_build_graph()，Qwen3 前向计算图（tokens/embd 双入口）
-│   ├── kv_cache.{h,cpp}          # 增量 KV cache
-│   ├── tokenizer.{h,cpp}         # 自研 byte-level BPE 分词器（从 GGUF 元数据构建）
-│   ├── sampler.{h,cpp}           # 采样策略（greedy / temperature / top-k / top-p / 重复惩罚）
-│   ├── common.{h,cpp}            # 计时器、字节数格式化等工具
-│   └── log.h                     # 日志宏
-├── examples/llm/api_test/          # 链接 frostfall 库的端到端调用示例（同时也是 CMake target）
-│   ├── infer_nothink_blocking.cpp  # 非流式 + 关闭思考：单轮/工具调用/多轮
-│   ├── infer_nothink_stream.cpp    # 流式 + 关闭思考：单轮/工具调用/多轮
-│   ├── infer_yesthink_blocking.cpp # 非流式 + 开启思考
-│   ├── infer_yesthink_stream.cpp   # 流式 + 开启思考
-│   ├── infer_test_util.h           # 公共工具：打印/统计/CLI 解析/runner
-│   └── llm_infer_conf.json         # 示例 EngineConfig
-├── examples/asr/api_test/
-│   └── asr_align_v01.cpp           # asr/v0.1 数值对齐示例（对照 Python fp32 参考逐层比对）
-├── tools/                # HF -> GGUF 转换脚本（LLM/ASR）+ ASR 参考数据导出
-│   ├── convert_hf_to_gguf.py       # Qwen3-0.6B → GGUF
-│   ├── convert_asr_hf_to_gguf.py   # Qwen3-ASR-0.6B → GGUF（qwen3-asr 架构契约）
-│   └── export_asr_reference.py     # ASR 对齐参考数据导出（fp32；支持 --wav 真人语音）
-├── third_party/ggml/     # ggml v0.15.3（内置源码，随仓库跟踪）
-├── doc/llm/design_llm.md         # 基础推理链路设计文档（v0.1~v0.3）
-├── doc/llm/design_llm_v1.0.md    # 通用推理接口设计文档（v1.0，InferenceEngine）
-├── doc/llm/code_analysis_llm-v0.1.md  # v0.1 逐接口代码走读
-├── doc/llm/code_analysis_llm-v0.2.md  # v0.2 逐接口代码走读
-├── doc/llm/code_analysis_llm-v0.3.md  # v0.3 采样策略逐接口走读
-├── doc/asr/design_asr.md          # ASR 版本规划（asr/v0.1 ~ asr/v1.0）与 v0.1 实施记录
-├── doc/asr/code_analysis_asr-v0.1.md  # asr/v0.1 逐接口代码走读 + 端到端执行步骤
-└── CMakeLists.txt
+```text
+原始模型 ──转换脚本──→ GGUF ──────────────────────┐
+                                                ↓
+WAV ──Python 前处理 / 音频编码 / 融合──→ Embedding ──C++ Decoder──→ token / 文字
+                                     └──Python Decoder──→ 数值参考 ↗ 对比
 ```
 
----
+已提供：
+- Qwen3-ASR-0.6B 完整 GGUF 转换和加载，包含 612 个文本/音频权重张量。
+- 真实 WAV 或内置合成信号的 Python 参考导出，自动语言和指定中文两套案例。
+- C++ 外部 Embedding prefill、KV cache 增量 decode、贪心生成和末位 LM Head。
+- 逐层 hidden、logits/top-k、参考 token 历史下的 decode 及自由生成一致性检查。
 
-## 环境依赖
+**尚未提供直接接收 PCM/WAV 的 C++ ASR API。**C++ 音频 Encoder、Log-Mel、语言/正文结构化返回、流式、取消和长音频能力属于后续版本。当前程序不是麦克风实时识别服务，也不承诺准确率或实时性能。
 
-构建库本身与全部示例可执行文件只需要 C++ 工具链：
+## 环境与模型准备
 
-| 依赖 | 说明 |
+以下命令均在**仓库根目录**执行；所有相对路径按当前工作目录解析。
+
+| 环节 | 需要的环境 |
 | --- | --- |
-| CMake ≥ 3.14 | 构建系统 |
-| C++17 编译器 | GCC 9+ 或 Clang 10+ |
+| 编译、运行 C++ | CMake ≥ 3.14、支持 C++17 的编译器；ggml 和 JSON 依赖已放在 `third_party/` |
+| 模型转换 | Python、`torch`、`numpy`、`safetensors`；GGUF writer 使用内置 `tools/gguf-py` |
+| 音频参考导出 | 同上，加 `transformers==4.57.6`；参考计算使用 CPU fp32，不要求 CUDA |
 
-以下依赖仅在做 HF → GGUF 模型转换时才需要：
-
-| 依赖 | 说明 |
-| --- | --- |
-| Python 3.8+ / `transformers` | 仅用于 `tools/convert_hf_to_gguf.py` 转换模型 |
-| `torch` / `safetensors` / `numpy` | 仅用于 ASR 转换与参考导出（`convert_asr_hf_to_gguf.py` / `export_asr_reference.py`） |
-| Qwen3-0.6B HF 模型 | 转换为 GGUF 后推理（LLM） |
-| Qwen3-ASR-0.6B HF 模型 | 转换为 GGUF 后推理（ASR） |
-
----
-
-## 构建
+建议使用独立 Python 环境（Python 3.10+，优先 3.12）。下面是安装方式，不代表任意依赖组合均已完成数值验收；正式复现应固定实际使用的版本。
 
 ```bash
-git clone <repo>
-cd frostfall.llm
-
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
-
-# 产物
-./build/libfrostfall.so                             # 共享库
-./build/examples/llm/api_test/infer_nothink_blocking    # LLM 调用示例可执行文件（共 4 个）
-./build/examples/asr/api_test/asr_align_v01         # ASR 数值对齐示例（asr/v0.1）
+python3 -m venv .venv-asr
+source .venv-asr/bin/activate
+python -m pip install torch numpy safetensors "transformers==4.57.6"
+python -c "import torch, transformers, numpy, safetensors; print(torch.__version__, transformers.__version__, numpy.__version__, safetensors.__version__)"
 ```
 
----
+已有环境可直接激活并执行最后一条检查，不需要重新创建。仅运行已有 GGUF + 参考数组的 C++ 程序时不需要 Python；换一条音频仍需运行 Python 导出。
 
-## 准备模型（HF → GGUF）
-
-推理需要 F16 GGUF 格式，用 llama.cpp 的转换脚本生成（GGUF 中会内置 tokenizer 元数据，
-库内部推理时无需再依赖 HF 模型目录）：
+从 [模型资源文档](doc/qwen_model/Qwen3-ASR-0.6B_Resource.md) 中的 ModelScope/Hugging Face 入口获取 **原始 Qwen3-ASR-0.6B**，不要混用其他模型或 `-hf` 变体。将 `MODEL_DIR` 改为实际目录：
 
 ```bash
-python tools/convert_hf_to_gguf.py \
-    /path/to/Qwen3-0.6B \
-    --outfile models/qwen3-0.6b-f16.gguf \
-    --outtype f16
+MODEL_DIR="/absolute/path/to/Qwen3-ASR-0.6B"
 ```
 
-ASR（Qwen3-ASR-0.6B）用本工程自带的转换脚本（tensor 命名/超参键遵循 `qwen3-asr` 架构契约，
-GGUF 内同样内置 tokenizer 元数据）：
+目录需要完整的权重、配置和 Tokenizer 文件，包括：
+
+```text
+model.safetensors
+config.json
+preprocessor_config.json
+generation_config.json
+chat_template.json
+tokenizer_config.json
+tokenizer.json / vocab.json / merges.txt 等 Tokenizer 资源
+```
+
+脚本当前直接读取单文件 `model.safetensors`，不是分片权重入口。F16 GGUF 约 1.75 GiB；Python 导出还需原始权重、fp32 模型和中间数组的内存，实际峰值显著高于 GGUF 文件大小。
+
+## 运行一条音频
+
+### 1. 转换模型，只需做一次
 
 ```bash
-python tools/convert_asr_hf_to_gguf.py \
-    /path/to/Qwen3-ASR-0.6B \
+mkdir -p models
+python tools/convert_asr_hf_to_gguf.py "$MODEL_DIR" \
     --outfile models/qwen3-asr-0.6b-f16.gguf \
     --mapping-out doc/asr/asr_v01_tensor_mapping.json
 ```
 
----
+关键输出为 `mapping OK: 612 tensors (text=311, audio=301)`。生成：
+- `models/qwen3-asr-0.6b-f16.gguf`：C++ 使用的模型权重、配置及词表。
+- `doc/asr/asr_v01_tensor_mapping.json`：原始张量到 GGUF 的映射清单。
 
-## 使用（库 API）
+已有同一原始模型转换出的 GGUF 可跳过。换音频不需要重新转换模型；GGUF 与参考数据必须来自同一模型版本。
 
-对外头文件只需要 `#include "inference_engine.h"` 和 `#include "llm_types.h"`，
-链接 `frostfall` 库即可。全部公共符号位于 `namespace Frostfall`。
-
-### 1. 初始化 `InferenceEngine`
-
-`EngineConfig` 可直接构造结构体，也可以从 JSON 文件 / JSON 字符串初始化：
-
-```json
-{
-  "model_path": "models/qwen3-0.6b-f16.gguf",
-  "n_ctx": 4096,
-  "n_threads": 4,
-  "max_tokens": 512,
-  "sampling": {
-    "temp": 0.0,
-    "top_k": 0,
-    "top_p": 1.0,
-    "repeat_penalty": 1.0,
-    "repeat_last_n": 64,
-    "seed": 42
-  }
-}
-```
-
-```cpp
-#include "inference_engine.h"
-#include "llm_types.h"
-
-using namespace Frostfall;
-
-InferenceEngine engine;
-if (!engine.InitFromJsonFile("examples/llm/api_test/llm_infer_conf.json")) {
-    // 加载模型/初始化失败
-}
-```
-
-`sampling` 是**引擎级固定配置**（`temp<=0` 即贪心 argmax，默认关闭其余采样项），不支持按请求覆盖。
-
-### 2. 非流式（blocking）推理
-
-```cpp
-LlmRequest req;
-req.msg_id          = "req-0001";
-req.enable_thinking = false;   // 是否开启 <think> 思考段
-req.stream          = false;   // 非流式：一次性拿完整结果
-req.messages = {
-    Message{Role::SYSTEM, "你是一个智能助手，请简洁回答用户的问题。", "", {}},
-    Message{Role::USER,   "你好，请用一句话介绍一下你自己。",          "", {}},
-};
-
-LlmResponse resp = engine.Infer(req);
-std::cout << resp.message.content << std::endl;   // 完整正文
-std::cout << resp.thinking << std::endl;           // 完整思考段（未开启则为空）
-```
-
-### 3. 流式推理
-
-`stream=true` 时通过回调逐帧接收；`thinking` / `content` / `tool_calls` 三类帧互斥：
-
-```cpp
-LlmRequest req;
-req.msg_id          = "req-0002";
-req.enable_thinking = false;
-req.stream          = true;
-req.messages = { /* 同上 */ };
-
-LlmResponse final_resp = engine.Infer(req, [](LlmResponse& chunk) {
-    if (!chunk.message.content.empty()) std::cout << chunk.message.content;
-    if (chunk.is_end) std::cout << "\n[finish_reason=" << (int)chunk.finish_reason << "]\n";
-});
-```
-
-### 4. Tool Calling
-
-工具定义写进某条 `system` message 的 `content`（Qwen3 官方 `<tools>` 模板），
-模型输出的 `<tool_call>` 会被自动解析进 `resp.message.tool_calls`；
-下一轮把该次调用的 `ToolCall::id` 原样填进对应工具结果 message 的 `tool_call_id`：
-
-```cpp
-// Round 1：触发 tool call
-LlmResponse resp1 = engine.Infer(round1);
-// resp1.message.tool_calls[0] = { id="call_0", name="ACControl", arguments="{\"action\":\"open\"}" }
-
-// Round 2：回填工具结果
-Message asst;
-asst.role       = Role::ASSISTANT;
-asst.tool_calls = { resp1.message.tool_calls[0] };
-
-Message tool_msg;
-tool_msg.role         = Role::TOOL;
-tool_msg.tool_call_id = resp1.message.tool_calls[0].id;   // 与上面配对
-tool_msg.content      = "{\"status\":\"success\"}";
-
-round2.messages = { system_msg, user_msg, asst, tool_msg, next_user_msg };
-LlmResponse resp2 = engine.Infer(round2);
-```
-
-### 5. 取消 / 统计
-
-```cpp
-engine.Cancel();                       // 任意线程调用，打断正在进行的 Infer()
-InferenceStats s = engine.GetLastStats();  // prompt/gen 吞吐、TTFT 等（调试用，非协议字段）
-```
-
-更完整的用例（单轮 / 工具调用 / 多轮，流式与非流式、开启与关闭思考模式的全组合）见
-`examples/llm/api_test/` 下的四个 `.cpp` 文件。
-
----
-
-## 运行调用示例（examples/llm/api_test）
-
-每个 `.cpp` 编译成独立可执行文件，统一读取 JSON 配置文件、可选只跑某一个用例：
+### 2. 导出这条音频的输入与参考结果
 
 ```bash
-./build/examples/llm/api_test/infer_nothink_blocking --config examples/llm/api_test/llm_infer_conf.json
-./build/examples/llm/api_test/infer_nothink_stream   --config examples/llm/api_test/llm_infer_conf.json
-./build/examples/llm/api_test/infer_yesthink_blocking --config examples/llm/api_test/llm_infer_conf.json
-./build/examples/llm/api_test/infer_yesthink_stream   --config examples/llm/api_test/llm_infer_conf.json
-
-# 只跑指定编号的用例（1=简单单轮 2=Tool Calling 3=多轮）
-./build/examples/llm/api_test/infer_nothink_blocking --config examples/llm/api_test/llm_infer_conf.json --test 2
+python tools/export_asr_reference.py "$MODEL_DIR" \
+    --wav data/test_asr_001.wav \
+    --out-dir work/asr_ref_wav \
+    --max-new-tokens 128
 ```
 
----
+替换 `--wav` 即可使用自己的录音。建议先选单声道 16 kHz PCM16 WAV，且不超过 8 秒，以单注意力窗口内的短音频建立对齐基线；这不是脚本已严格实施的时长上限，也不是模型能力上限。
 
-## ASR（asr/v0.1：数值对齐验证版）
+Python WAV 入口支持 8/16/32-bit 整数 PCM，多声道取平均，非 16 kHz 使用线性插值重采样；24-bit、浮点 WAV、MP3 等请预先转换。优先直接提供 16 kHz 波形，避免简单重采样影响质量。
 
-ASR 复用 LLM 的 Decoder 链路。v0.1 的目标：**证明现有 Decoder 可直接用于 ASR**——
-音频特征由 Python 参考脚本以 fp32 导出，C++ 通过外部 Embedding 入口消费，
-逐层 hidden / 末位 logits / 生成 token 与官方实现逐项对齐。
+脚本自动生成两套目录：
+
+| 目录 | 模式 | 内容 |
+| --- | --- | --- |
+| `work/asr_ref_wav/auto/` | 自动语言 | 模型自行生成语言协议和正文 |
+| `work/asr_ref_wav/lang/` | 指定中文 | 输入已含 `language Chinese<asr_text>`，继续生成正文 |
+
+每套包含 11 个 `.npy`、`test.wav`、`meta.json`。`meta.json` 保存 Prompt、音频长度和生成长度；`gen_preview` 只展示前几个 token，不是完整转写。当前 CLI 没有任意 `--language` 或 `--context` 参数。
+
+### 3. 编译 ASR 程序
 
 ```bash
-# 1) 导出参考数据（默认内置确定性合成音频；--wav 换成真人语音，任意采样率/声道自动归一到 16k mono）
-python tools/export_asr_reference.py /path/to/Qwen3-ASR-0.6B --wav data/test_asr_001.wav
-#    -> work/asr_ref_wav/{auto,lang}（不传 --wav 时输出 work/asr_ref/{auto,lang}）
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFROSTFALL_BUILD_EXAMPLES=ON
+cmake --build build --target asr_align_v01 -j2
+```
 
-# 2) 数值对齐（--ref-dir 与上一步 --out-dir 对应；auto=自动判语言，lang=强制 Chinese 前缀）
+`-j2` 为编译并行度，可按机器内存和 CPU 调整。主要产物：
+
+```text
+build/libfrostfall.so
+build/examples/asr/api_test/asr_align_v01
+```
+
+### 4. C++ 生成文字并检查对齐
+
+```bash
 ./build/examples/asr/api_test/asr_align_v01 \
-    --gguf models/qwen3-asr-0.6b-f16.gguf --ref-dir work/asr_ref_wav/auto
-#    退出码 0 = PASS；末尾 [text] 是模型对音频的真实响应（真人语音下即转写结果）
+    --gguf models/qwen3-asr-0.6b-f16.gguf \
+    --ref-dir work/asr_ref_wav/auto \
+    --max-gen 160
+
+./build/examples/asr/api_test/asr_align_v01 \
+    --gguf models/qwen3-asr-0.6b-f16.gguf \
+    --ref-dir work/asr_ref_wav/lang \
+    --max-gen 160
 ```
 
-v0.1 边界：音频计算（音频 Encoder / Log-Mel）与 WAV 输入 API 尚未在 C++ 侧实现（asr/v0.2 ~ v0.3 规划），
-生成文本是"参考 Embedding 驱动"的验证结果。
+`--ref-dir` 必须指向具体 `auto/` 或 `lang/`，不是它们的父目录。程序先验证 prefill 和 teacher forcing，再重置有效 KV 历史自由生成，最后打印 `[text]` 与 `PASS/FAIL`。
 
----
+两个生成上限不同：
+- Python `--max-new-tokens`：参考生成循环上限，默认 32；当前实现循环结束后还会额外保存一步，`n_gen` 可能达到上限加 1。
+- C++ `--max-gen`：自由生成上限，默认 32，也影响 KV 容量预留。应至少覆盖参考 `n_gen`，上述示例预留为 160。
 
-## API 参考（核心类型速查）
+**参考序列应自然生成到 EOS。**若 Python 达到上限仍未结束，请提高其上限并重新导出，同时提高 C++ 上限。单纯放大 C++ 上限无法补全已经截断的参考序列。
 
-### `EngineConfig`
+## 如何看结果与排查问题
 
-| 字段 | 含义 | 默认 |
-| --- | --- | --- |
-| `model_path` | GGUF 路径（必填） | — |
-| `n_ctx` | KV cache 上限（会被 `n_ctx_train` 截断） | `4096` |
-| `n_threads` | CPU 计算线程数 | `4` |
-| `max_tokens` | 请求未指定 `max_tokens` 时的默认上限 | `512` |
-| `sampling` | 引擎级固定采样参数（`SamplingParams`） | 见下 |
+示意输出（具体数值和文字随音频、模型及环境变化）：
 
-### `SamplingParams`（采样链：重复惩罚 → top-k → temperature+softmax → top-p → 随机采样）
+```text
+-- prefill (embd entry, layer outputs on) --
+  ...逐层 hidden、prefill logits 误差与 top10_hit...
+-- teacher forcing (...) --
+  ...后续 decode 的最差误差...
+-- free greedy generation --
+  [free_gen] n=... (ref ...) prefix_match=.../...
+  [text] language Chinese<asr_text>识别出的文字。<|im_end|>
+== result: PASS (failures=0) ==
+```
 
-| 字段 | 含义 | 默认 | 关闭取值 |
-| --- | --- | --- | --- |
-| `temp` | 采样温度；`<=0` 退化为贪心 argmax | `0` | `<=0` |
-| `top_k` | 只在 logit 最高的 N 个候选里采样 | `0` | `<=0` |
-| `top_p` | nucleus 采样：保留累计概率达到 P 的最小候选集 | `1.0` | `>=1.0` |
-| `repeat_penalty` | 重复惩罚系数，`>1` 抑制近期出现过的 token | `1.0` | `1.0` |
-| `repeat_last_n` | 重复惩罚回看窗口；`<0` 表示整段历史 | `64` | — |
-| `seed` | 随机种子；哨兵值 `0xFFFFFFFF` 表示运行时随机取值 | 随机 | — |
+- `[text]`：C++ 自由生成的原始解码文本，保留协议和 special tokens。指定中文案例通常只有正文和结束标记，因为语言前缀已在输入中。
+- `prefix_match`：逐 token 比较结果；通过还要求生成总长度相同。
+- `PASS` / 退出码 0：当前案例通过工具内置检查；不是 CER/WER 准确率评估，也不是完整输入健壮性保证。
+- `FAIL` / 非零退出：数值、序列不一致或运行失败；不要仅凭文字相似判定通过。
 
-### `LlmRequest`
-
-| 字段 | 含义 |
+| 现象 | 优先检查 |
 | --- | --- |
-| `msg_id` | 请求唯一标识，原样回传到 `LlmResponse` |
-| `messages` | 单轮/多轮共用，按时间顺序排列；工具定义写进某条 `system` message |
-| `enable_thinking` | 是否启用 `<think>` 思考段（默认关闭） |
-| `stream` | `true`=流式回调，`false`=一次性返回 |
-| `max_tokens` | 本次最多生成 token；`<=0` 用 `EngineConfig.max_tokens` |
+| Python 提示缺少模块 | 是否激活正确环境；执行前面的 import 检查 |
+| 找不到模型文件、架构或张量数不符 | `MODEL_DIR` 是否指向原始完整模型，GGUF 是否由本工程 ASR 转换脚本生成 |
+| 找不到 npy | 是否先导出，`--ref-dir` 是否指向具体案例，是否在仓库根目录运行 |
+| 生成文字相同但长度比较失败 | 两端生成上限、参考是否自然到 EOS、是否混用了旧参考目录 |
+| hidden/logits 偏差大或出现 NaN | 模型版本、参考精度、数组是否完整；按代码分析中的数据交接点定位 |
+| 输出为空或不合理 | 先听录音、确认格式；数值对齐与识别质量是两件事 |
 
-### `FinishReason`
+没有真实音频时，可以使用内置的确定性 5 秒合成信号检查计算链路：
 
-| 取值 | 含义 |
-| --- | --- |
-| `STOP` | 自然结束（命中 eos），且本轮无 tool_call |
-| `TOOL_CALLS` | 自然结束，且本轮产出过 tool_call |
-| `LENGTH` | 触达 `max_tokens` 或 `n_ctx` 上限 |
-| `CANCELLED` | 被 `Cancel()` 主动打断 |
-| `ERROR` | 底层错误（未初始化、编码失败等） |
+```bash
+python tools/export_asr_reference.py "$MODEL_DIR" --out-dir work/asr_ref
+./build/examples/asr/api_test/asr_align_v01 \
+    --gguf models/qwen3-asr-0.6b-f16.gguf --ref-dir work/asr_ref/auto --max-gen 64
+./build/examples/asr/api_test/asr_align_v01 \
+    --gguf models/qwen3-asr-0.6b-f16.gguf --ref-dir work/asr_ref/lang --max-gen 64
+```
 
----
-
-## 版本路线图
-
-| 版本 | 主题 | 状态 |
-| --- | --- | --- |
-| v0.1 | 主体链路：加载 → 构图 → 前向 → 贪心解码 | ✅ 已完成 |
-| v0.2 | 自研 BPE Tokenizer + 增量 KV cache + 计时/内存统计 | ✅ 已完成 |
-| v0.3 | 采样策略：temperature / top-k / top-p / 重复惩罚 / 可复现 seed | ✅ 已完成 |
-| v0.4 | 量化权重（Q4_K/Q8_0）、CUDA backend | 规划中 |
-| **v1.0** | 通用推理接口：`InferenceEngine` + thinking/tool-call 分离 + 无状态多轮 | ✅ 当前版本 |
-
-**ASR 主线**（详细规划见 `doc/asr/design_asr.md`）：
-
-| 版本 | 主题 | 状态 |
-| --- | --- | --- |
-| **asr/v0.1** | ASR GGUF 转换/加载、外部 Embedding 输入、Decoder 数值对齐 | ✅ 当前版本 |
-| asr/v0.2 | ggml 音频 Encoder、ASR Prompt、音频特征替换 | 规划中 |
-| asr/v0.3 | C++ Log-Mel、PCM/WAV 输入、最小阻塞 ASR API（首个完整离线版本） | 规划中 |
-| asr/v0.4 | 完整离线 API、文本流式、取消、统计、分批 prefill、跨窗口验证 | 规划中 |
-| asr/v0.5 | 持续 PCM 输入、流式状态、文本回改、结束刷新（真音频流式） | 规划中 |
-| asr/v1.0 | API/格式冻结、质量回归、资源测量与针对性优化 | 规划中 |
+合成信号不是人声，历史基线出现过 `language None<asr_text>` 或 `哦。`，不能用这些文字评价识别率。更换测试音频时建议使用新的 `--out-dir`，避免覆盖已有基线；不传 `--out-dir` 时，真实 WAV 默认写入 `work/asr_ref_wav`，合成信号默认写入 `work/asr_ref`。
