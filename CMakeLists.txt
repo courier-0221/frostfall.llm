@@ -16,6 +16,7 @@ add_subdirectory(third_party/ggml)
 set(FROSTFALL_CORE_SOURCES
     src/model.cpp
     src/graph.cpp
+    src/audio_encoder.cpp
     src/kv_cache.cpp
     src/tokenizer.cpp
     src/sampler.cpp

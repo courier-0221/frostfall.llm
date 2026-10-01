@@ -115,8 +115,15 @@ def gelu(x):
     return torch.nn.functional.gelu(x)
 
 
-def audio_tower_forward(mel: torch.Tensor, feature_len: int, w: dict, acfg: dict):
-    """mel: [128, T] 有效帧（fp32）。返回 [A, 1024] 音频特征。"""
+def audio_tower_forward(mel: torch.Tensor, feature_len: int, w: dict, acfg: dict,
+                        collect: dict = None):
+    """mel: [128, T] 有效帧（fp32）。返回 [A, 1024] 音频特征。
+
+    collect（可选，asr/v0.2 数值对齐用）：落盘音频塔中间量，键为
+      conv_out  : [A,896]  CNN + 局部正弦位置编码、去 padding 后的 Transformer 输入
+      hidden    : [n_layer+1,A,896]  hidden[0]=conv_out，hidden[i]=第 i 层 Transformer 输出
+      features  : [A,1024] 最终投影输出（与返回值一致）
+    """
     d_model = acfg["d_model"]            # 896
     n_window = acfg["n_window"]          # 50 -> CNN 分块 100 帧
     n_mels = acfg["num_mel_bins"]        # 128
@@ -160,6 +167,9 @@ def audio_tower_forward(mel: torch.Tensor, feature_len: int, w: dict, acfg: dict
     # ---- 去掉 padding 位置 -> [A,896] ----
     hidden = x[padded_mask_after_cnn]  # [A,896]
     n_aftercnn = int(padded_mask_after_cnn.shape[-1])
+    if collect is not None:
+        collect["conv_out"] = hidden.detach().float().numpy().astype(np.float32)
+        collect["_hidden"] = [hidden.detach().float().numpy().astype(np.float32)]
     # v0.1 约束：单注意力窗口内的短音频（A <= 13*(800/100)=104），此时块内全局双向注意力
     assert n_aftercnn <= (acfg["n_window_infer"] // (n_window * 2)) * 13, \
         f"audio too long for v0.1 single-window baseline: A={n_aftercnn}"
@@ -193,12 +203,17 @@ def audio_tower_forward(mel: torch.Tensor, feature_len: int, w: dict, acfg: dict
         h = gelu(h)
         h = torch.nn.functional.linear(h, w[p + "fc2.weight"], w[p + "fc2.bias"])
         hidden = residual + h
+        if collect is not None:
+            collect["_hidden"].append(hidden.detach().float().numpy().astype(np.float32))
 
     # ---- 输出投影 ----
     hidden = torch.nn.functional.layer_norm(hidden, (d_model,), w["ln_post.weight"], w["ln_post.bias"], eps)
     hidden = torch.nn.functional.linear(hidden, w["proj1.weight"], w["proj1.bias"])
     hidden = gelu(hidden)
     hidden = torch.nn.functional.linear(hidden, w["proj2.weight"], w["proj2.bias"])  # [A,1024]
+    if collect is not None:
+        collect["hidden"] = np.stack(collect.pop("_hidden"), axis=0).astype(np.float32)
+        collect["features"] = hidden.detach().float().numpy().astype(np.float32)
     return hidden
 
 
@@ -241,7 +256,8 @@ def export_case(case: str, pcm: np.ndarray, mel_extractor, tok, weights, cfg,
     # 剕离 thinker.audio_tower. 前缀，并转 fp32（源权重 BF16）
     audio_w = {k[len("thinker.audio_tower."):]: v.float()
                for k, v in weights.items() if k.startswith("thinker.audio_tower.")}
-    audio_features = audio_tower_forward(mel_valid, T, audio_w, audio_cfg)  # [A,1024]
+    audio_collect = {}
+    audio_features = audio_tower_forward(mel_valid, T, audio_w, audio_cfg, audio_collect)  # [A,1024]
     A = audio_features.shape[0]
     # A(T) = 13*floor(T/100) + ceil((T%100)/8)，即官方整数公式
     A_expect = 13 * (T // 100) + ((T % 100) + 7) // 8
@@ -322,6 +338,10 @@ def export_case(case: str, pcm: np.ndarray, mel_extractor, tok, weights, cfg,
     np.save(out_dir / "mel.npy", mel_valid.numpy().astype(np.float32))
     np.save(out_dir / "ids.npy", np.array(ids, dtype=np.int32))
     np.save(out_dir / "audio_positions.npy", np.array(audio_positions, dtype=np.int32))
+    # asr/v0.2 音频塔中间量（供 C++ 音频 Encoder 逐段对齐）
+    np.save(out_dir / "audio_conv_out.npy", audio_collect["conv_out"])   # [A,896]
+    np.save(out_dir / "audio_hidden.npy", audio_collect["hidden"])       # [n_layer+1,A,896]
+    np.save(out_dir / "audio_features.npy", audio_collect["features"])   # [A,1024]
     np.save(out_dir / "embd.npy", inputs_embeds.numpy().astype(np.float32))  # [S,1024] 行=token
     np.save(out_dir / "layer_hidden.npy", layer_hidden.numpy().astype(np.float32))
     np.save(out_dir / "prefill_logits.npy", logits.numpy().astype(np.float32))
