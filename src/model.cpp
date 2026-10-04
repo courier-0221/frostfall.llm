@@ -229,6 +229,17 @@ bool qwen3_model_load(const std::string & fname, qwen3_model & model) {
         ah.audio_start_token_id = gguf_get_i32_any(ctx_gguf, "asr.audio_start_token_id", -1);
         ah.audio_end_token_id   = gguf_get_i32_any(ctx_gguf, "asr.audio_end_token_id", -1);
         ah.audio_token_id       = gguf_get_i32_any(ctx_gguf, "asr.audio_token_id", -1);
+        // Log-Mel 前处理契约（asr/v0.3 起 C++ 端复现 WhisperFeatureExtractor）；
+        // 缺省值即本模型契约缺省（16k/400/160/128/right），键缺失时继续可用。
+        ah.mel_sampling_rate = gguf_get_i32_any(ctx_gguf, "asr.mel.sampling_rate", 16000);
+        ah.mel_n_fft         = gguf_get_i32_any(ctx_gguf, "asr.mel.n_fft", 400);
+        ah.mel_hop_length    = gguf_get_i32_any(ctx_gguf, "asr.mel.hop_length", 160);
+        ah.mel_feature_size  = gguf_get_i32_any(ctx_gguf, "asr.mel.feature_size", 128);
+        {
+            const int64_t kid = gguf_find_key(ctx_gguf, "asr.mel.padding_side");
+            ah.mel_padding_side = (kid >= 0 && gguf_get_kv_type(ctx_gguf, kid) == GGUF_TYPE_STRING)
+                                      ? gguf_get_val_str(ctx_gguf, kid) : "right";
+        }
         {
             const int64_t kid = gguf_find_key(ctx_gguf, "asr.eos_token_ids");
             if (kid >= 0 && gguf_get_kv_type(ctx_gguf, kid) == GGUF_TYPE_ARRAY) {
@@ -243,6 +254,13 @@ bool qwen3_model_load(const std::string & fname, qwen3_model & model) {
             ah.output_dim != hp.n_embd || ah.num_mel_bins <= 0 || ah.audio_token_id < 0) {
             LOG(ERROR) << __func__ << ": incomplete/invalid asr.* metadata"
                        << " (audio.output_dim must match text embedding_length)";
+            gguf_free(ctx_gguf);
+            return false;
+        }
+        if (ah.mel_n_fft < 2 || ah.mel_hop_length <= 0 || ah.mel_feature_size != ah.num_mel_bins ||
+            ah.mel_sampling_rate < 2 * ah.mel_n_fft) {
+            LOG(ERROR) << __func__ << ": invalid asr.mel.* metadata"
+                       << " (mel.feature_size must match audio num_mel_bins)";
             gguf_free(ctx_gguf);
             return false;
         }

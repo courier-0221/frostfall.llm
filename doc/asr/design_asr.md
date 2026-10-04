@@ -11,7 +11,7 @@
 - 已确认方向：CPU 离线优先；LLM 与 ASR 共存并共享底层 Decoder。
 - 首阶段：v0.1～v0.3，交付可验证的纯 C++ 短音频离线转写。
 - 后续阶段：v0.4～v1.0，逐步完善 API、较长音频、流式和发布质量。
-- 状态：asr/v0.1 已实施并通过验收（见 §2.6 实施记录）；v0.2 及以后仍为计划，版本名称不表示对应 Git 分支或 tag 已创建。
+- 状态：asr/v0.1～v0.3 已实施并通过验收（v0.1 见 §2.6、v0.3 见 §4.7 实施记录；v0.2 交付与对齐结论见 `doc/asr/code_analysis_asr-v0.2.md` 与 README）；v0.4 及以后仍为计划，版本名称不表示对应 Git 分支或 tag 已创建。
 
 ### 1.2 各版本实现内容与预期效果
 
@@ -205,6 +205,39 @@ llm/v1.0
 ### 4.6 本版不实现
 
 不承诺长音频、文本流式、麦克风流式、GPU、量化、重采样、多种压缩格式或时间戳。
+
+### 4.7 实施记录（2026-10-03，已验收）
+
+#### 交付物
+
+| 交付物 | 位置 | 说明 |
+| --- | --- | --- |
+| C++ Log-Mel | `src/log_mel.h` / `src/log_mel.cpp` | 纯 DSP：Slaney filterbank（运行时生成，与 `mel_filter_bank(norm="slaney")` 逐系数一致）+ 周期 Hann + 居中 STFT（反射填充，剥离移植 whisper.cpp `fft()/dft()` 至 double）+ `log10(max(·,1e-10))` → 丢尾帧 → `max(·,max-8)` → `(·+4)/4` |
+| 最小阻塞 ASR API | `src/asr_engine.h` / `src/asr_engine.cpp` | `qwen3_asr_engine` 的 `Init`/`InitFromJsonFile`/`Transcribe`；请求含 PCM/采样率/context/language/max_gen，响应含 text/language/完成原因/调试量（mel、T/A/S、gen_ids、raw） |
+| `asr.mel.*` 契约读取 | `src/model.h` / `src/model.cpp` | 读取 `asr.mel.sampling_rate/n_fft/hop_length/feature_size/padding_side`，校验 `feature_size == num_mel_bins`；缺省值即本模型契约缺省 |
+| 离线示例 + 配置样例 | `examples/asr/api_test/asr_transcribe_v03.cpp`、`asr_conf_v03.json` | WAV/PCM 输入转写、重复调用一致性、`--ref-dir` golden 对齐、`--check-errors` 错误路径演示 |
+
+#### 与官方 `WhisperFeatureExtractor` 的差异点核对（对应 §4.3 表）
+
+官方 golden（`transformers 4.57.6`，`_torch_extract_fbank_features`，torch 路程全程 f32）与本实现的已核对差异：
+
+| 差异点 | 结论 |
+| --- | --- |
+| Slaney filterbank | 公式逐系数复现（`max_abs=0` 已用 numpy 验证）；系数按官方 f32 量化 |
+| 窗函数 | 周期 Hann（`0.5*(1-cos(2πi/N))`，f32）；与 `torch.hann_window(400)` 差 ≤ 1 ulp |
+| 预加重 / dither | 无（未引入） |
+| 对数与归一化 | `log10(max(·,1e-10))` → 丢最后一帧 → `max(·,max-8)` → `(·+4)/4`，全程 f32，同官方（golden 为 torch 路径全程 f32 产出） |
+| 有效帧裁剪 | `T = floor(n_samples/hop)`（居中 STFT 产 T+1 帧后丢尾帧，与 attention mask 数一致）；`pcm.npy` 与 `mel.npy` 按 golden pcm 对齐 |
+| FFT 精度 | 官方 pocketfft-f32，本实现 double FFT + f32 量化（窗积、功率谱、mel 积累按官方 f32 语义量化点模拟，官方 golden 由 torch 路径全程 f32 产出） |
+
+**Mel 对齐结果**（auto/lang 两案例相同输入）：`max_abs = 2.13e-5`、`RMSE = 6.17e-7`（n=24320），远小于音频塔容差。
+
+#### 端到端与回归结果
+
+- 端到端：`pcm.npy → C++ 全链路 → 语言 + 文字`；自动语言输出 `language Chinese<asr_text>今天天气怎么样？<|im_end|>` 且 8/8 个生成 token 与 golden `decode_ids.npy` 完全一致；指定中文 5/5 一致；同一输入二次调用逐 token 一致（KV 重置验证）。
+- 边界与错误：正好 8 秒（A=104）通过；静音输出 `language None` + 空正文；非 hop 整数倍时长（24001 样本）正常；空输入 / 非 16 kHz / 超 8 秒 / NaN、WAV 立体声或 44.1 kHz 均显式拒绝（`--check-errors` 演示）。英文合成语音返回 `language=English` 与英文标点正文（合成音质下识别质量不作为验收项）。
+- 回归：`asr_align_v02` auto/lang 均 PASS（音频塔逐段、ids、融合、logits、生成不变）；LLM 四类示例（nothink/yesthink × stream/blocking，各 3 用例）全部运行通过并恢复正常文本/工具调用输出。
+- 覆盖缺口：英文/数字/标点的真人语音与多说话人语料未纳入本轮（当前仅合成英文与单条中文正样本）；完整覆盖与质量回归按规划属 `asr/v1.0` 的质量回归项。
 
 ## 五、asr/v0.4 版本规划：离线 API、文本流式与较长音频
 

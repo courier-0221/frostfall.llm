@@ -65,6 +65,14 @@ struct qwen3_asr_hparams {
     int32_t conv_padding  = 1;
     float   layer_norm_eps = 1e-5f;
 
+    // Log-Mel 前处理契约（GGUF asr.mel.*，asr/v0.3 起由 C++ 端复现，见 src/log_mel.*）。
+    // 无权重、纯 DSP；缺省值为本模型契约缺省（16k/400/160/128/right）。
+    int32_t mel_sampling_rate = 16000;
+    int32_t mel_n_fft         = 400;
+    int32_t mel_hop_length    = 160;
+    int32_t mel_feature_size  = 128; // 必须等于 num_mel_bins
+    std::string mel_padding_side = "right";
+
     // ASR 协议 token
     int32_t audio_start_token_id = -1; // <|audio_start|>（151669）
     int32_t audio_end_token_id   = -1; // <|audio_end|>（151670）

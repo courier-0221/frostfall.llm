@@ -17,6 +17,8 @@ set(FROSTFALL_CORE_SOURCES
     src/model.cpp
     src/graph.cpp
     src/audio_encoder.cpp
+    src/log_mel.cpp
+    src/asr_engine.cpp
     src/kv_cache.cpp
     src/tokenizer.cpp
     src/sampler.cpp
@@ -34,4 +36,6 @@ target_link_libraries(frostfall PUBLIC ggml Threads::Threads)
 option(FROSTFALL_BUILD_EXAMPLES "Build frostfall example executables" ON)
 if (FROSTFALL_BUILD_EXAMPLES)
     add_subdirectory(examples/asr/api_test)
+    # # LLM 四类调用示例（回归用；asr/v1.0 之前与 ASR 共存，见 doc/asr/design_asr.md 附录 A）
+    # add_subdirectory(examples/llm/api_test)
 endif()

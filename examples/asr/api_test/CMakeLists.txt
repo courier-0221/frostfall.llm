@@ -10,5 +10,12 @@
 
 # asr_align_v02：输入参考 Mel，C++ 完成音频 Encoder + ASR Prompt + 特征融合 +
 # Decoder 生成，逐段对齐音频塔（conv_out / 18 层 / 投影）、融合 Embedding 与 Decoder 输出。
-add_executable(asr_align_v02 asr_align_v02.cpp)
-target_link_libraries(asr_align_v02 PRIVATE frostfall)
+# add_executable(asr_align_v02 asr_align_v02.cpp)
+# target_link_libraries(asr_align_v02 PRIVATE frostfall)
+
+# asr_transcribe_v03：纯 C++ 离线转写示例（asr/v0.3）。输入 PCM16 WAV 或参考
+# pcm.npy，经 src/asr_engine 的最小阻塞 API 得到语言与文字；--ref-dir 时对比
+# Log-Mel 与生成 token 的 golden；--check-errors 演示显式报错路径。
+add_executable(asr_transcribe_v03 asr_transcribe_v03.cpp)
+target_link_libraries(asr_transcribe_v03 PRIVATE frostfall)
+configure_file(asr_conf_v03.json asr_conf_v03.json COPYONLY)
