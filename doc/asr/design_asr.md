@@ -11,7 +11,7 @@
 - 已确认方向：CPU 离线优先；LLM 与 ASR 共存并共享底层 Decoder。
 - 首阶段：v0.1～v0.3，交付可验证的纯 C++ 短音频离线转写。
 - 后续阶段：v0.4～v1.0，逐步完善 API、较长音频、流式和发布质量。
-- 状态：asr/v0.1～v0.3 已实施并通过验收（v0.1 见 §2.6、v0.3 见 §4.7 实施记录；v0.2 交付与对齐结论见 `doc/asr/code_analysis_asr-v0.2.md` 与 README）；v0.4 及以后仍为计划，版本名称不表示对应 Git 分支或 tag 已创建。
+- 状态：asr/v0.1～v0.4 已实施并通过验收（v0.1 见 §2.6、v0.3 见 §4.7、v0.4 见 §5.7 实施记录；v0.2 交付与对齐结论见 `doc/asr/code_analysis_asr-v0.2.md` 与 README）；v0.5 及以后仍为计划，版本名称不表示对应 Git 分支或 tag 已创建。
 
 ### 1.2 各版本实现内容与预期效果
 
@@ -271,6 +271,53 @@ llm/v1.0
 ### 5.5 本版不实现
 
 不是边录边识别；不直接承诺 20 分钟输入、无界长音频、实时性能或永久增量音频缓存。
+
+### 5.6 实施记录补充：跨窗口参考语义固定（2026-10-04）
+
+跨窗口验收前项（§5.2 第 5 条、附录 B），本版固定参考语义如下：
+
+- **参考后端**：官方 `get_audio_cu_seqlens`（transformers `models/qwen3_asr/modeling_qwen3_asr.py`）定义的 varlen 分块；其自定义 eager 路径不消费 `cu_seqlens`（退化为全局双向）属已确认的后端差异，**不作为参考语义**。
+- **窗口边界构造**：`window_aftercnn = max(块内有效位置数) × (n_window_infer/(n_window·2))`，本模型完整块 13 × 8 = 104 个位置；逐 CNN 块累加，凑满 104 关窗、尾块收尾；窗口内双向、窗口间隔离（非滑窗、非因果 mask）。
+- **依据**：transformers 5.18.0 `models/qwen3_asr/modeling_qwen3_asr.py` 的 `get_audio_cu_seqlens` 与 `Qwen3ASRAudioAttention`（非 varlen 后端按 `cu_seqlens` 切段逐段注意力，即块对角语义）。
+- **参考导出**：`scripts/asr/export_asr_window_reference.py` 在 eager SDPA 上显式构造块对角 attn_mask 复现该语义，导出 `work/asr_ref_win/cross/`（20 s → T=2000，A=260，窗口边界 [0,104,208,260]）。
+
+### 5.7 实施记录（2026-10-04，已验收）
+
+#### 交付物
+
+| 交付物 | 位置 | 说明 |
+| --- | --- | --- |
+| 完整离线/文本流式 API | `src/asr_engine.h` / `src/asr_engine.cpp` | `Transcribe(req, cb)`：cb 省略 = v0.3 阻塞行为不变；传 cb 即文本流式（STREAM_LANG 一次性 + STREAM_TEXT 按 UTF-8 完整序列增量）；callback 返回 false = 调用方取消（等价置位 `request.cancel`） |
+| 取消机制 | `qwen3_asr_request.cancel`（`std::atomic<bool>*`）+ 引擎检查点 | 检查边界＝音频塔 CNN 分块批、prefill 批、decode step；取消返回 `ok=true` + `FINISH_CANCELLED` + 取消时 `stage` + 部分正文（已回调增量），不写 error；单个 ggml 算子不可打断（最小粒度 = 一个 prefill 批/decode step） |
+| 错误协议 | `resp.err`（`QWEN3_ASR_ERR_*`）+ `resp.stage` | NOT_INIT / BAD_INPUT / AUDIO_TOO_LONG / WINDOW_FULL（保留定义，当前单路径编码不触发）/ CONTEXT_INSUFFICIENT / INTERNAL；`resp.error` 人读文本保持 v0.3 兼容 |
+| 分批 prefill | `prefill_batch_size`（config/request 两级，0=单批） | 批内完整因果（pos/mask/n_past 同步顺延），末位 logits 与单批一致；实测 S=40/bs=8、S=275/bs=128、S=405/bs=128 均 6 批内完成，gen_ids 与单批一致 |
+| 跨窗口音频编码 | `src/audio_encoder.cpp`：`window_boundaries` + 块对角 mask + `qwen3_asr_max_audio_positions` | 单窗口（A≤104）走 v0.3 无 mask 路径逐位一致；A>104 时按官方 cu_seqlens 语义块对角双向注意力；CNN 分块批执行（`chunk_capacity`，默认不分批）控制峰值激活 |
+| 跨窗口参考导出 | `scripts/asr/export_asr_window_reference.py` → `work/asr_ref_win/cross/` | 见 §5.6 |
+| v0.4 示例 + 配置 | `examples/asr/api_test/asr_transcribe_v04.cpp`、`asr_conf_v04.json` | 阻塞 vs 流式一致性、回调取消（prefill/decode 两个取消点）、外部线程取消、`--prefill-batch`、`--window-ref` 跨窗口 golden 对齐、`--check-errors` 错误分类、性能统计打印；`--ref-dir` 下 gen_ids 对齐 v0.3 golden |
+| 串行与重复调用 | `std::mutex` 串行化 Init/Transcribe；Init 幂等 | 并发调用排队逐个执行；重复 Init 保持首份模型；每请求重置 KV |
+| 代码分析 | `doc/asr/code_analysis_asr-v0.4.md` | v0.4 实现细节与误用边界：API 面、跨窗口语义推导、流式缓冲状态机、取消检查点、统计计时口径 |
+
+#### 跨窗口与较长音频验收
+
+- **golden 对齐**（`--window-ref work/asr_ref_win/cross`，20 s，A=260，3 窗口）：A 260=260；窗口边界 [0,104,208,260] 逐值一致；conv_out rmse=2.7e-4、18 层逐层 rmse=8.1e-4、features rmse=6.2e-5（容差沿用 `asr_align_v02` 的 kAudioRmseTol=0.20，全部通过）。
+- **单窗口不变性**：v0.3 回归（auto 8/8、lang 5/5 gen_ids 完全一致；Log-Mel 不变）。
+- **30 秒**：T=3000、A=390（4 窗口）、S=405 入 KV（n_ctx=4096）；两次调用一致，blocking 与流式一致；RTF≈0.70（总耗时 ≈20.99 s，含 once-only 音频塔 9.2 s 与 prefill 11.0 s）。
+- **上下文不足**：n_ctx=64 小引擎 + 长音频 → 显式 `context_insufficient`（prefill 163+1 > 64）。
+
+#### 其他验收结论
+
+- 同一输入阻塞与文本流式最终 text 逐字节一致（24 字节中文正文、9 英文案例均验证；`今天天气怎么样？` 以 4 个 TEXT 增量 [今天][天气][怎么样][？] 回调）。
+- 首可见文字不含语言协议 token：`first_model_token=1.79 s`（首生成 token）≠ `first_visible_text=2.16 s`（首个正文增量）；指定语言模式（协议在 prompt 预置）首可见即首正文增量。
+- 取消：`--cancel-after 1` 首个 TEXT 回调取消 → `stage=prefill`（首 token 于 prefill 末位产出、尚未进 decode step）；第 2 个 TEXT 增量后取消 → `stage=decode`；两者部分正文均为已回调前缀。
+- 错误分类：空输入/NaN → bad_input；非 16 kHz → bad_input（附正确采样率说明）；超 30 s → audio_too_long；上下文不足 → context_insufficient；全部显式拒绝、无静默截断。
+- 分批 prefill 收益：S=405/bs=128 时峰值计算缓冲 6.94 MB（单批 S=405 约 20 MB 级别）；得益于 gallocr 复用，bs=8 时峰值 0.61 MB。
+- 回归：LLM 四类示例（nothink/yesthink × blocking/stream，各 3 用例）通过，恢复正常文本/工具调用输出（本轮已重新接入构建）；`asr_transcribe_v03` 双案例 PASS。
+
+#### 已知边界（不改变承诺）
+
+- `WINDOW_FULL` 错误码保留定义但当前不触发：A>104 走块对角掩码单次编码，超 KV 由 CONTEXT_INSUFFICIENT 拦截；如未来改为非重叠逐段策略，用该码区分音频窗口配额耗尽。
+- `chunk_capacity`（CNN 分块批）默认不分批；启用仅影响内存峰值，不改数值。
+- 取消检查不进入 ggml 算子内部；单个大 op（如整段 CNN 卷积图）完成前无法中断（§5.2 第 2 条已声明）。
 
 ## 六、asr/v0.5 版本规划：持续音频输入与真正流式转写
 

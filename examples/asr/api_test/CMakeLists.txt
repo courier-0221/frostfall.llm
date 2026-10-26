@@ -16,6 +16,14 @@
 # asr_transcribe_v03：纯 C++ 离线转写示例（asr/v0.3）。输入 PCM16 WAV 或参考
 # pcm.npy，经 src/asr_engine 的最小阻塞 API 得到语言与文字；--ref-dir 时对比
 # Log-Mel 与生成 token 的 golden；--check-errors 演示显式报错路径。
-add_executable(asr_transcribe_v03 asr_transcribe_v03.cpp)
-target_link_libraries(asr_transcribe_v03 PRIVATE frostfall)
-configure_file(asr_conf_v03.json asr_conf_v03.json COPYONLY)
+# add_executable(asr_transcribe_v03 asr_transcribe_v03.cpp)
+# target_link_libraries(asr_transcribe_v03 PRIVATE frostfall)
+# configure_file(asr_conf_v03.json asr_conf_v03.json COPYONLY)
+
+# asr_transcribe_v04：asr/v0.4 完整离线 API 示例。阻塞 vs 文本流式一致性、
+# 回调取消 / 外部线程取消、--prefill-batch 分批 prefill、--window-ref 跨窗口
+# golden 对齐（scripts/asr/export_asr_window_reference.py 导出）、--check-errors
+# 错误分类（含上下文不足）与性能统计展示。
+add_executable(asr_transcribe_v04 asr_transcribe_v04.cpp)
+target_link_libraries(asr_transcribe_v04 PRIVATE frostfall)
+configure_file(asr_conf_v04.json asr_conf_v04.json COPYONLY)

@@ -186,10 +186,42 @@ bool run_cnn_stage(const qwen3_model & model, const AudioCfg & cfg,
     return true;
 }
 
+// ---- 窗口边界（官方 get_audio_cu_seqlens 语义，asr/v0.4） ----
+// aftercnn_lens：各 CNN 块的有效位置数（完整块 13，尾块 ceil(len/8)）。
+// window_aftercnn = max(aftercnn_lens) * (n_window_infer / chunk)（本模型 = 13*8 = 104）。
+// 逐块累加：凑满 window_aftercnn 关窗，尾块收尾；纯块对角（窗口内双向、窗口间隔离）。
+// 单窗口输入（总 A <= window_aftercnn）得到单一 [0, A] 边界 —— 与 v0.3 全局双向逐位一致。
+void window_boundaries(const std::vector<int32_t> & aftercnn_lens,
+                       int32_t n_window_infer, int32_t chunk,
+                       std::vector<int32_t> & bounds /* size = n_window+1；末边界 = A */) {
+    const int32_t ratio   = n_window_infer / chunk;              // 800/100 = 8 个 CNN 块
+    const int32_t max_len = *std::max_element(aftercnn_lens.begin(), aftercnn_lens.end());
+    const int32_t window  = max_len * ratio;                     // 13*8 = 104
+    // 官方 get_audio_cu_seqlens：先产窗口长度列表，再 cumsum 成边界。
+    bounds.clear();
+    bounds.push_back(0);
+    int32_t cur = 0;
+    for (int32_t alen : aftercnn_lens) {
+        cur += alen;
+        if (cur >= window) { bounds.push_back(bounds.back() + cur); cur = 0; }
+    }
+    if (cur > 0) bounds.push_back(bounds.back() + cur);
+    // bounds.back() = 累计位置数 = A（调用方校验）；单窗口输入只有一个 [0, A] 窗口。
+}
+
+// 位置 p 所在窗口下标（bounds 有序，线性查找；窗口数小，可接受）。
+static int32_t window_index(const std::vector<int32_t> & bounds, int32_t p) {
+    int32_t w = 0;
+    while (w + 1 < (int32_t) bounds.size() - 1 && p >= bounds[(size_t) w + 1]) ++w;
+    return w;
+}
+
 // ---- 阶段 2：18 层音频 Transformer + 输出投影 ----
 // 输入 conv_out [A, d_model]（host，已去 padding、按块拼接），输出 features [A, output_dim]。
+// bounds：注意力窗口边界（size = n_window+1，bounds[0]=0、末值 = A；单窗口 = 全局双向）。
 bool run_transformer_stage(const qwen3_model & model, const AudioCfg & cfg,
                            const std::vector<float> & conv_out, int32_t A,
+                           const std::vector<int32_t> & bounds,
                            bool want_intermediates,
                            ggml_backend_t backend, ggml_gallocr_t allocr,
                            std::vector<float> & features,   // [A, output_dim]
@@ -206,6 +238,26 @@ bool run_transformer_stage(const qwen3_model & model, const AudioCfg & cfg,
     struct ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, A);
     ggml_set_name(x, "audio_in");
     ggml_set_input(x);
+
+    // ---- 窗口 mask（asr/v0.4）：块对角双向；同窗口可见(0)，跨窗口 -inf。
+    //      ne0 = key 位置，ne1 = query 位置；kq 为 [A_k, A_q, n_head]，按维度复用。
+    //      单窗口（bounds.size()==2）时 mask 全 0，等价 v0.3 全局双向。
+    std::vector<float> mask;
+    struct ggml_tensor * win_mask = nullptr;
+    const int32_t n_win = (int32_t) bounds.size() - 1;
+    if (n_win > 1) {
+        mask.assign((size_t) A * A, 0.0f);
+        for (int32_t q = 0; q < A; ++q) {
+            const int32_t wq = window_index(bounds, q);
+            for (int32_t k = 0; k < A; ++k) {
+                const int32_t wk = window_index(bounds, k);
+                if (wq != wk) mask[(size_t) q * A + k] = -INFINITY;
+            }
+        }
+        win_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, A, A); // ne0=key, ne1=query
+        ggml_set_name(win_mask, "win_mask");
+        ggml_set_input(win_mask);
+    }
 
     std::vector<struct ggml_tensor *> layer_outs;
 
@@ -232,7 +284,9 @@ bool run_transformer_stage(const qwen3_model & model, const AudioCfg & cfg,
         struct ggml_tensor * kp = ggml_permute(ctx, k, 0, 2, 1, 3); // [head_dim, A, n_head]
         struct ggml_tensor * qp = ggml_permute(ctx, q, 0, 2, 1, 3); // [head_dim, A, n_head]
         struct ggml_tensor * kq = ggml_mul_mat(ctx, kp, qp);        // [A_k, A_q, n_head]
-        kq = ggml_soft_max_ext(ctx, kq, nullptr, scale, 0.0f);
+        // mask 复用：soft_max_ext 的 mask 按 [n_kv, n_tokens] 对 kq 的前两维广播；
+        // 多窗口时启用，单窗口保持 v0.3 的无 mask 路径。
+        kq = ggml_soft_max_ext(ctx, kq, win_mask, scale, 0.0f);
 
         // V 转成 [A_k, head_dim, n_head]，kqv = V^T softmax(kq) -> [head_dim, A_q, n_head]
         // 注：ggml_permute(a, ax0,ax1,ax2,ax3) 把 a 的第 i 轴放到结果的 ax_i 位置；
@@ -280,6 +334,9 @@ bool run_transformer_stage(const qwen3_model & model, const AudioCfg & cfg,
 
     ggml_gallocr_alloc_graph(allocr, gf);
     ggml_backend_tensor_set(x, conv_out.data(), 0, (size_t) d_model * A * sizeof(float));
+    if (win_mask) {
+        ggml_backend_tensor_set(win_mask, mask.data(), 0, mask.size() * sizeof(float));
+    }
     ggml_backend_graph_compute(backend, gf);
 
     features.assign((size_t) A * cfg.output_dim, 0.0f);
@@ -299,54 +356,87 @@ bool run_transformer_stage(const qwen3_model & model, const AudioCfg & cfg,
     return true;
 }
 
+
+// 分块 CNN 序列执行：把全部 N 个 CNN 块按 chunk_capacity 分批，逐批构图运行。
+// 与一次构全量图行为一致（各块完全独立），但控制了单批 CNN 激活的内存峰值；
+// on_cancel 为真时立即中止。返回 false 仅表示取消。
+static bool run_cnn_batches(const qwen3_model & model, const AudioCfg & cfg,
+                            const float * mel, int32_t T, int32_t N, int32_t chunk_capacity,
+                            ggml_backend_t backend, ggml_gallocr_t allocr,
+                            std::vector<float> & stage1,   // [d_model, conv_time_out, N]
+                            const std::function<bool()> & on_cancel) {
+    stage1.assign((size_t) cfg.d_model * cfg.conv_time_out * N, 0.0f);
+    if (chunk_capacity <= 0 || N <= chunk_capacity) {
+        return run_cnn_stage(model, cfg, mel, T, N, backend, allocr, stage1) ? !on_cancel() : false;
+    }
+    for (int32_t n0 = 0; n0 < N; n0 += chunk_capacity) {
+        if (on_cancel()) return false;
+        const int32_t nb = std::min(chunk_capacity, N - n0);
+        std::vector<float> part;
+        if (!run_cnn_stage(model, cfg, mel, T - n0 * cfg.chunk, nb, backend, allocr, part))
+            return false;
+        std::memcpy(stage1.data() + (size_t) n0 * cfg.d_model * cfg.conv_time_out,
+                    part.data(), part.size() * sizeof(float));
+    }
+    return true;
+}
+
 } // namespace
+
+int32_t qwen3_asr_max_audio_positions(const qwen3_model & model) {
+    if (!model.is_asr) return 0;
+    const int32_t chunk = model.asr_hparams.n_window * 2;        // 100 帧
+    const int32_t ratio = model.asr_hparams.n_window_infer / chunk; // 8 个 CNN 块
+    constexpr int32_t kPosPerFullChunk = 13;                      // chunk=100 -> conv_time_out=13
+    return ratio * kPosPerFullChunk;                              // 8*13 = 104
+}
 
 bool qwen3_asr_encode_audio(const qwen3_model & model,
                             const float * mel, int32_t T,
                             bool want_intermediates,
-                            qwen3_asr_audio_result & out) {
+                            qwen3_asr_audio_result & out,
+                            const std::function<bool()> & on_cancel,
+                            int32_t chunk_capacity) {
     if (!model.is_asr) {
         LOG(ERROR) << __func__ << ": model is not qwen3-asr";
         return false;
     }
-    if (!mel || T <= 0) {
-        LOG(ERROR) << __func__ << ": invalid mel input (T=" << T << ")";
+    if (T <= 0) {
+        LOG(ERROR) << __func__ << ": invalid mel frames T=" << T;
         return false;
     }
     const AudioCfg cfg = make_cfg(model.asr_hparams);
-    if (cfg.num_mel_bins <= 0 || cfg.d_model <= 0 || cfg.n_head <= 0) {
-        LOG(ERROR) << __func__ << ": incomplete audio hparams";
-        return false;
-    }
 
     const int32_t N = (T + cfg.chunk - 1) / cfg.chunk; // CNN 块数 = ceil(T/100)
     const int32_t A = qwen3_asr_audio_positions(T);
-    // v0.2 单注意力窗口约束：A <= 13*(n_window_infer/chunk)
-    const int32_t a_max = 13 * (model.asr_hparams.n_window_infer / cfg.chunk);
-    if (A > a_max) {
-        LOG(ERROR) << __func__ << ": audio too long for v0.2 single-window encoder (A=" << A
-                   << " > " << a_max << "); cross-window support is asr/v0.4";
-        return false;
-    }
+    // asr/v0.4：跨窗口输入（A > window_aftercnn=104）不再拒绝 —— 音频 Transformer
+    // 按官方 cu_seqlens 块对角双向窗口处理（窗口内双向、窗口间隔离）。容量上限
+    // （prompt 放不进 KV）由上层 asr_engine 显式校验，不在此静默截断。
 
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
     if (!allocr) return false;
 
-    // ---- 阶段 1：CNN ----
+    // ---- 阶段 1：CNN（分批执行以控制峰值内存；批边界可取消） ----
     std::vector<float> stage1; // [d_model, conv_time_out, N]
-    if (!run_cnn_stage(model, cfg, mel, T, N, model.backend, allocr, stage1)) {
+    const std::function<bool()> no_cancel = [] { return false; }; // nullptr 安全
+    if (!run_cnn_batches(model, cfg, mel, T, N, chunk_capacity,
+                         model.backend, allocr, stage1,
+                         on_cancel ? on_cancel : no_cancel)) {
         ggml_gallocr_free(allocr);
         return false;
     }
 
-    // ---- 去 padding、按块顺序拼接为 [A, d_model] ----
+    // ---- 去 padding、按块顺序拼接为 [A, d_model]，同时记录各块有效位置数 ----
     // stage1 内存布局：element(d, p, n) 位于 d + p*d_model + n*d_model*conv_time_out
     std::vector<float> conv_out((size_t) A * cfg.d_model, 0.0f);
+    std::vector<int32_t> aftercnn_lens;
+    aftercnn_lens.reserve((size_t) N);
     {
         int32_t row = 0;
         for (int32_t n = 0; n < N; ++n) {
             const int32_t len = std::min(cfg.chunk, T - n * cfg.chunk);
             const int32_t valid = (len + 7) / 8; // = ceil(len/8)；len=100 -> 13
+            aftercnn_lens.push_back(valid);
             for (int32_t p = 0; p < valid; ++p, ++row) {
                 const float * src = stage1.data() + (size_t) n * cfg.d_model * cfg.conv_time_out
                                     + (size_t) p * cfg.d_model;
@@ -361,9 +451,18 @@ bool qwen3_asr_encode_audio(const qwen3_model & model,
         }
     }
 
+    // ---- 官方窗口边界（块对角双向注意力；单窗口输入退化为全局双向） ----
+    std::vector<int32_t> bounds;
+    window_boundaries(aftercnn_lens, model.asr_hparams.n_window_infer, cfg.chunk, bounds);
+    if (bounds.back() != A) {
+        LOG(ERROR) << __func__ << ": window boundaries sum " << bounds.back() << " != A=" << A;
+        ggml_gallocr_free(allocr);
+        return false;
+    }
+
     // ---- 阶段 2：Transformer + 投影 ----
     std::vector<float> features, hidden_all;
-    if (!run_transformer_stage(model, cfg, conv_out, A, want_intermediates,
+    if (!run_transformer_stage(model, cfg, conv_out, A, bounds, want_intermediates,
                                model.backend, allocr, features, hidden_all)) {
         ggml_gallocr_free(allocr);
         return false;
